@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build outputs
+.build/
+.build_tools/
+.pyinstaller_build/
+tcl_runtime/
+build/
+dist/
+*.spec
+
+# AIS inputs, outputs, and resumable caches
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.bin
+.*_cache/
+.*_rows/
+*.building.xlsx
+AIS月報_錯誤報告_*.txt
+
+# Editors and Windows
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

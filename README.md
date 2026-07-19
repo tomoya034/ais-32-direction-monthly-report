@@ -12,7 +12,7 @@
 
 ## 下載與使用
 
-1. 前往 [Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32方位月報工具_v0.0.1.zip`。
+1. 前往 [Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v0.0.1.zip`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇含每日 AIS Excel 的月份資料夾。
 4. 確認自動偵測的年月與輸出位置。

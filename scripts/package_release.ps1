@@ -16,7 +16,7 @@ if (-not (Test-Path -LiteralPath $exe)) {
     throw "找不到建置結果：$exe"
 }
 
-$packageName = "AIS_32方位月報工具_v$version"
+$packageName = "AIS_32_Direction_Monthly_Report_v$version"
 $packageDirectory = Join-Path $distPath $packageName
 $zipPath = Join-Path $distPath "$packageName.zip"
 New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ais-32-direction-monthly-report"
-version = "1.3.0"
-description = "Offline Windows tool for producing KLNG AIS 32-direction monthly Excel reports."
+version = "1.4.0"
+description = "Offline Windows tool for producing multi-port AIS 32-direction monthly Excel reports."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -16,7 +16,7 @@ dependencies = [
   "openpyxl>=3.1,<4",
   "XlsxWriter>=3.2,<4",
 ]
-keywords = ["AIS", "Excel", "maritime", "KLNG", "monthly-report"]
+keywords = ["AIS", "Excel", "maritime", "multi-port", "monthly-report"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "License :: OSI Approved :: MIT License",

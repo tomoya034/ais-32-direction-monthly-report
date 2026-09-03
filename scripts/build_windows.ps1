@@ -19,15 +19,26 @@ New-Item -ItemType Directory -Path $tclRuntime -Force | Out-Null
     -r (Join-Path $projectRoot "requirements-build.txt")
 if ($LASTEXITCODE -ne 0) { throw "建置相依套件安裝失敗。" }
 
-$prefixArguments = @("-c", "import sys; print(sys.prefix)")
-$pythonPrefix = (& $Python @prefixArguments).Trim()
-$tclSource = Join-Path $pythonPrefix "tcl\tcl8.6"
-$tkSource = Join-Path $pythonPrefix "tcl\tk8.6"
-if (-not (Test-Path -LiteralPath (Join-Path $tclSource "init.tcl"))) {
-    throw "找不到 Tcl 8.6：$tclSource"
+$pythonPrefixes = @(
+    & $Python -c "import sys; print(sys.prefix); print(sys.base_prefix)"
+) | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique
+
+$tclSource = $null
+$tkSource = $null
+foreach ($pythonPrefix in $pythonPrefixes) {
+    $candidateTcl = Join-Path $pythonPrefix "tcl\tcl8.6"
+    $candidateTk = Join-Path $pythonPrefix "tcl\tk8.6"
+    if (
+        (Test-Path -LiteralPath (Join-Path $candidateTcl "init.tcl")) -and
+        (Test-Path -LiteralPath (Join-Path $candidateTk "tk.tcl"))
+    ) {
+        $tclSource = $candidateTcl
+        $tkSource = $candidateTk
+        break
+    }
 }
-if (-not (Test-Path -LiteralPath (Join-Path $tkSource "tk.tcl"))) {
-    throw "找不到 Tk 8.6：$tkSource"
+if (-not $tclSource -or -not $tkSource) {
+    throw "找不到 Tcl/Tk 8.6；已檢查：$($pythonPrefixes -join ', ')"
 }
 
 Copy-Item -LiteralPath $tclSource -Destination $tclRuntime -Recurse -Force

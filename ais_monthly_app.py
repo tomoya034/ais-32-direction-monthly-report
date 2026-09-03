@@ -29,7 +29,7 @@ import xlsxwriter
 
 
 APP_TITLE = "AIS 32方位月報一鍵製作"
-APP_VERSION = "0.0.1"
+APP_VERSION = "1.3.0"
 CACHE_VERSION = 2
 LEGACY_SPOOL_VERSION = 1
 EXCEL_MAX_DATA_ROWS = 1_048_575
@@ -160,6 +160,18 @@ def emit(callback: ProgressCallback | None, **payload: object) -> None:
         callback(payload)
 
 
+def default_worker_count() -> int:
+    return min(3, max(1, os.cpu_count() or 1))
+
+
+def default_output_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        application_root = Path(sys.executable).resolve().parent
+    else:
+        application_root = Path(__file__).resolve().parent.parent
+    return application_root / "output" / "AIS月報"
+
+
 def parse_source_date(filename: str) -> date | None:
     match = FILENAME_RE.match(filename)
     if not match:
@@ -196,6 +208,30 @@ def detect_available_months(folder: Path) -> list[tuple[int, int, int]]:
         key = (parsed.year, parsed.month)
         counts[key] = counts.get(key, 0) + 1
     return [(year, month, count) for (year, month), count in sorted(counts.items())]
+
+
+def month_option_label(year: int, month: int, count: int) -> str:
+    return f"{year} 年 {month} 月（{count} 個每日檔）"
+
+
+def resolve_source_month(
+    folder: Path,
+    year: int | None = None,
+    month: int | None = None,
+) -> tuple[int, int, int]:
+    """Resolve the processing month from fixed-format source filenames."""
+    if (year is None) != (month is None):
+        raise ValueError("年份與月份必須同時指定；也可以兩者都省略，改由檔名自動判定。")
+    available = detect_available_months(folder)
+    if not available:
+        raise ValueError("找不到符合 D&TMOK KLNG_YYYYMMDD_*.xlsx 格式的檔案。")
+    if year is None:
+        return max(available, key=lambda item: (item[0], item[1]))
+    for detected in available:
+        if detected[:2] == (year, month):
+            return detected
+    listing = "、".join(f"{item[0]} 年 {item[1]} 月" for item in available)
+    raise ValueError(f"檔名中沒有 {year} 年 {month} 月的資料；偵測到：{listing}。")
 
 
 def degree_to_direction_index(value: object) -> tuple[int, float] | None:
@@ -251,6 +287,23 @@ def locate_headers(header_row: Sequence[object]) -> dict[str, int]:
         friendly = ", ".join(missing)
         raise ValueError(f"缺少必要欄位：{friendly}")
     return result
+
+
+def locate_data_worksheet(workbook: object) -> tuple[object, dict[str, int]]:
+    worksheets = list(workbook.worksheets)
+    worksheets.sort(key=lambda worksheet: worksheet.title.strip().casefold() != "ais")
+    inspected: list[str] = []
+    for worksheet in worksheets:
+        header = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header:
+            inspected.append(f"{worksheet.title}（空白）")
+            continue
+        try:
+            return worksheet, locate_headers(header)
+        except ValueError:
+            inspected.append(worksheet.title)
+    names = "、".join(inspected) if inspected else "無工作表"
+    raise ValueError(f"找不到包含必要欄位的工作表（已檢查：{names}）")
 
 
 def select_cluster(
@@ -646,12 +699,8 @@ def process_source_file(
             f"無法開啟來源檔「{source_file.name}」。檔案可能損壞、尚未同步完成，或不是有效的 .xlsx。原始錯誤：{error}"
         ) from error
     try:
-        worksheet = workbook[workbook.sheetnames[0]]
-        header = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        if not header:
-            raise SourceFileError(f"來源檔「{source_file.name}」第一張工作表沒有標題列。")
         try:
-            indexes = locate_headers(header)
+            worksheet, indexes = locate_data_worksheet(workbook)
         except ValueError as error:
             raise SourceFileError(
                 f"來源檔「{source_file.name}」{error}。需要 msg_type、LONGITUDE_DESC、bearing、distance in nautical miles。"
@@ -1612,13 +1661,13 @@ def launch_gui() -> None:
             self.output_var = tk.StringVar()
             self.legacy_var = tk.BooleanVar(value=True)
             self.legacy_path_var = tk.StringVar(value="將依新版檔名自動建立")
-            self.year_var = tk.StringVar(value=str(datetime.now().year))
-            self.month_var = tk.StringVar(value=str(datetime.now().month))
+            self.month_choice_var = tk.StringVar(value="請先選擇每日資料夾")
+            self.month_options: dict[str, tuple[int, int, int]] = {}
             self.max_distance_var = tk.StringVar(value="500")
             self.tolerance_var = tk.StringVar(value="10")
             self.cluster_var = tk.StringVar(value="3")
             self.top_var = tk.StringVar(value="50")
-            self.workers_var = tk.StringVar(value=str(min(3, os.cpu_count() or 1)))
+            self.workers_var = tk.StringVar(value=str(default_worker_count()))
             self.message_types_var = tk.StringVar(value="1,2,3,18,19")
             self.status_var = tk.StringVar(value="請先選擇每日 AIS Excel 所在資料夾。")
             self.progress_text_var = tk.StringVar(value="尚未開始")
@@ -1641,7 +1690,10 @@ def launch_gui() -> None:
             files_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
             files_box.columnconfigure(1, weight=1)
             ttk.Label(files_box, text="每日資料夾").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
-            ttk.Entry(files_box, textvariable=self.source_var).grid(row=0, column=1, sticky="ew", pady=5)
+            self.source_entry = ttk.Entry(files_box, textvariable=self.source_var)
+            self.source_entry.grid(row=0, column=1, sticky="ew", pady=5)
+            self.source_entry.bind("<Return>", self.refresh_source_from_entry)
+            self.source_entry.bind("<FocusOut>", self.refresh_source_from_entry)
             ttk.Button(files_box, text="選擇…", command=self.choose_source).grid(row=0, column=2, padx=(8, 0), pady=5)
             ttk.Label(files_box, text="輸出月報").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
             ttk.Entry(files_box, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", pady=5)
@@ -1652,21 +1704,28 @@ def launch_gui() -> None:
 
             config_box = ttk.LabelFrame(container, text="2  月份與判斷設定", style="Section.TLabelframe")
             config_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+            ttk.Label(config_box, text="製作月份（由檔名判定）").grid(row=0, column=0, sticky="w")
+            self.month_combo = ttk.Combobox(
+                config_box,
+                textvariable=self.month_choice_var,
+                state="readonly",
+                width=25,
+            )
+            self.month_combo.grid(row=1, column=0, sticky="w", pady=(3, 8))
+            self.month_combo.bind("<<ComboboxSelected>>", self.month_selection_changed)
             labels = [
-                ("年份", self.year_var, 8),
-                ("月份", self.month_var, 5),
                 ("距離上限 NM", self.max_distance_var, 8),
                 ("群聚差距 %", self.tolerance_var, 7),
                 ("至少筆數", self.cluster_var, 5),
                 ("每方向候選", self.top_var, 6),
                 ("平行檔案數", self.workers_var, 5),
             ]
-            for column, (label, variable, width) in enumerate(labels):
-                ttk.Label(config_box, text=label).grid(row=0, column=column, sticky="w", padx=(0 if column == 0 else 10, 0))
-                ttk.Entry(config_box, textvariable=variable, width=width).grid(row=1, column=column, sticky="w", padx=(0 if column == 0 else 10, 0), pady=(3, 8))
+            for column, (label, variable, width) in enumerate(labels, start=1):
+                ttk.Label(config_box, text=label).grid(row=0, column=column, sticky="w", padx=(10, 0))
+                ttk.Entry(config_box, textvariable=variable, width=width).grid(row=1, column=column, sticky="w", padx=(10, 0), pady=(3, 8))
             ttk.Label(config_box, text="AIS 訊息類型").grid(row=2, column=0, sticky="w")
             ttk.Entry(config_box, textvariable=self.message_types_var, width=24).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0))
-            ttk.Label(config_box, text="船舶位置預設 1,2,3,18,19；每日完成即保存快取，可中斷後續跑。", foreground="#5B6573").grid(row=2, column=3, columnspan=4, sticky="w", padx=(12, 0))
+            ttk.Label(config_box, text="船舶位置預設 1,2,3,18,19；每日完成即保存快取，可中斷後續跑。", foreground="#5B6573").grid(row=2, column=3, columnspan=3, sticky="w", padx=(12, 0))
 
             run_box = ttk.LabelFrame(container, text="3  一鍵執行", style="Section.TLabelframe")
             run_box.grid(row=2, column=0, sticky="nsew")
@@ -1704,18 +1763,54 @@ def launch_gui() -> None:
                 return
             source = Path(selected)
             self.source_var.set(str(source))
+            self.refresh_detected_months(source, announce=True, update_output=True)
+
+        def refresh_source_from_entry(self, _event: object | None = None) -> None:
+            raw = self.source_var.get().strip()
+            if not raw:
+                return
+            source = Path(raw)
+            if source.is_dir():
+                self.refresh_detected_months(source, announce=False, update_output=True)
+
+        def refresh_detected_months(self, source: Path, *, announce: bool, update_output: bool) -> None:
             months = detect_available_months(source)
-            if months:
-                year, month, count = max(months, key=lambda item: (item[2], item[0], item[1]))
-                self.year_var.set(str(year))
-                self.month_var.set(str(month))
-                default_dir = Path(__file__).resolve().parent.parent / "output" / "AIS月報"
-                default_name = f"KLNG {year}年{month}月 32方位數值_新版自動分析.xlsx"
-                self.output_var.set(str(default_dir / default_name))
-                self.status_var.set(f"偵測到 {year} 年 {month} 月，共 {count} 個每日檔。")
-                self.append_log(self.status_var.get())
-            else:
+            previous_choice = self.month_options.get(self.month_choice_var.get())
+            self.month_options = {
+                month_option_label(year, month, count): (year, month, count)
+                for year, month, count in months
+            }
+            self.month_combo.configure(values=list(self.month_options))
+            if not months:
+                self.month_choice_var.set("找不到固定格式的每日檔")
                 self.status_var.set("找不到符合 D&TMOK KLNG_YYYYMMDD_*.xlsx 格式的檔案。")
+                if announce:
+                    self.append_log(self.status_var.get())
+                return
+
+            selected = previous_choice if previous_choice in months else max(months, key=lambda item: (item[0], item[1]))
+            self.month_choice_var.set(month_option_label(*selected))
+            year, month, count = selected
+            if update_output:
+                default_name = f"KLNG {year}年{month}月 32方位數值_新版自動分析.xlsx"
+                self.output_var.set(str(default_output_directory() / default_name))
+            if len(months) == 1:
+                message = f"已由檔名判定 {year} 年 {month} 月，共 {count} 個每日檔；不需輸入月份。"
+            else:
+                message = f"檔名含 {len(months)} 個月份，已選最新的 {year} 年 {month} 月；可由唯讀清單改選。"
+            self.status_var.set(message)
+            if announce:
+                self.append_log(message)
+
+        def month_selection_changed(self, _event: object | None = None) -> None:
+            selected = self.month_options.get(self.month_choice_var.get())
+            if selected is None:
+                return
+            year, month, count = selected
+            default_name = f"KLNG {year}年{month}月 32方位數值_新版自動分析.xlsx"
+            self.output_var.set(str(default_output_directory() / default_name))
+            self.status_var.set(f"已由檔名選定 {year} 年 {month} 月，共 {count} 個每日檔。")
+            self.append_log(self.status_var.get())
 
         def choose_output(self) -> None:
             initial = Path(self.output_var.get()) if self.output_var.get() else Path.cwd() / "KLNG 32方位數值.xlsx"
@@ -1739,18 +1834,28 @@ def launch_gui() -> None:
                 self.legacy_path_var.set("將依新版檔名自動建立")
 
         def build_config(self) -> AppConfig:
-            source = Path(self.source_var.get().strip())
-            output = Path(self.output_var.get().strip())
-            if not str(source):
+            source_text = self.source_var.get().strip()
+            output_text = self.output_var.get().strip()
+            if not source_text:
                 raise ValueError("請選擇每日資料夾。")
-            if not str(output):
+            if not output_text:
                 raise ValueError("請指定輸出月報。")
+            source = Path(source_text)
+            output = Path(output_text)
+            detected = detect_available_months(source)
+            if not detected:
+                raise ValueError("找不到符合 D&TMOK KLNG_YYYYMMDD_*.xlsx 格式的檔案。")
+            selected = self.month_options.get(self.month_choice_var.get())
+            if selected not in detected:
+                selected = max(detected, key=lambda item: (item[0], item[1]))
+                self.refresh_detected_months(source, announce=True, update_output=False)
+            year, month, _count = selected
             legacy_output = derive_legacy_output_path(output) if self.legacy_var.get() else None
             return AppConfig(
                 input_dir=source,
                 output_path=output,
-                year=int(self.year_var.get()),
-                month=int(self.month_var.get()),
+                year=year,
+                month=month,
                 legacy_output_path=legacy_output,
                 max_distance=float(self.max_distance_var.get()),
                 tolerance=float(self.tolerance_var.get()) / 100.0,
@@ -1943,14 +2048,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--input", type=Path, help="每日 D&TMOK KLNG Excel 資料夾")
     parser.add_argument("--output", type=Path, help="輸出 .xlsx")
     parser.add_argument("--legacy-output", type=Path, help="同時輸出的原格式相容版 .xlsx")
-    parser.add_argument("--year", type=int)
-    parser.add_argument("--month", type=int)
+    parser.add_argument("--year", type=int, help="可省略；預設從固定格式檔名自動判定")
+    parser.add_argument("--month", type=int, help="可省略；預設從固定格式檔名自動判定")
     parser.add_argument("--max-distance", type=float, default=500.0)
     parser.add_argument("--tolerance", type=float, default=10.0, help="百分比，例如 10")
     parser.add_argument("--cluster-size", type=int, default=3)
     parser.add_argument("--top-candidates", type=int, default=50)
     parser.add_argument("--message-types", default="1,2,3,18,19")
-    parser.add_argument("--workers", type=int, default=1, help="同時處理的每日檔案數，建議 2–4")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=default_worker_count(),
+        help="同時處理的每日檔案數；預設依電腦自動使用 1–3",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-files", type=int, help="測試用：只處理前 N 檔")
     arguments = parser.parse_args(argv)
@@ -1958,13 +2068,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if all(value is None for value in (arguments.input, arguments.output, arguments.legacy_output, arguments.year, arguments.month)):
         launch_gui()
         return 0
-    if None in (arguments.input, arguments.output, arguments.year, arguments.month):
-        parser.error("命令列模式必須同時指定 --input、--output、--year、--month")
+    if arguments.input is None or arguments.output is None:
+        parser.error("命令列模式必須同時指定 --input 與 --output；年份、月份可由檔名自動判定")
+    try:
+        year, month, count = resolve_source_month(arguments.input, arguments.year, arguments.month)
+    except ValueError as error:
+        parser.error(str(error))
+    print(f"Filename month detected: {year}-{month:02d} ({count} daily files)", flush=True)
     config = AppConfig(
         input_dir=arguments.input,
         output_path=arguments.output,
-        year=arguments.year,
-        month=arguments.month,
+        year=year,
+        month=month,
         legacy_output_path=arguments.legacy_output,
         max_distance=arguments.max_distance,
         tolerance=arguments.tolerance / 100.0,

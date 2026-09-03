@@ -1,21 +1,23 @@
 # AIS 32 方位月報一鍵製作
 
 [![Tests](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml/badge.svg)](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v0.0.1-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v0.0.1)
+[![Release](https://img.shields.io/badge/release-v1.3.0-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.3.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 離線讀取每日 `D&TMOK KLNG_YYYYMMDD_*.xlsx`，一次產生新版自動分析與原格式相容版兩份 Excel 月報。程式不使用雲端 API、不需要 Token，也不會上傳原始 AIS 資料。
 
 > `0.0.1` 是首個可分享測試版本。數值規則已自動化，但航向與岸向異常仍應由領域人員覆核。
+>
+> 目前正式版本為 `1.3.0`；航向與岸向異常仍需由領域人員完成人工複核。
 
 ![AIS 32 方位月報工具視窗](docs/images/app-window.png)
 
 ## 下載與使用
 
-1. 前往 [Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v0.0.1.zip`。
+1. 前往 [Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.3.0.zip`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇含每日 AIS Excel 的月份資料夾。
-4. 確認自動偵測的年月與輸出位置。
+4. 工具會直接從固定檔名中的 `YYYYMMDD` 判定製作月份；確認輸出位置即可。
 5. 保持勾選「同時產生原格式相容版」，按「開始全自動製作」。
 6. 完成後先查看新版工作簿的「待複核」工作表。
 
@@ -27,6 +29,19 @@ Windows 可能因程式尚未做商業程式碼簽章而顯示未知發行者。
   - 操作說明、每日候選、數值化判定理由、人工覆核欄、總表、待複核、處理紀錄與圖表。
 - `*_原格式相容版.xlsx`
   - 每日 A:C 完整排序資料、H:AM 第 2 列 32 方位結果、舊式總表、圖表及隱藏的「工作」對照表。
+
+## 影片手工作業已自動化
+
+- 不必先人工建立每月活頁簿或逐日工作表。
+- 不必逐方向套篩選、尋找異常高值、刪除整列、複製公式或重新排序。
+- 程式會只讀原始每日檔，完成訊息類型與東經篩選、32 方位換算、500 NM 上限、群聚選值、逐日表、總表及待複核清單。
+- 原始檔不會修改；排除原因、候選值與來源列號保留在新版分析檔供覆核。
+
+## 月份自動判定
+
+- 年份、月份以 `D&TMOK KLNG_YYYYMMDD_*.xlsx` 的檔名為唯一依據，不再自由輸入。
+- 一個資料夾只有一個月份時會直接選定；若含多個月份，介面顯示由檔名建立的唯讀清單並預選最新月份。
+- 開始製作前會再次掃描檔名，避免沿用先前資料夾的月份。
 
 ## 預設數值規則
 
@@ -65,8 +80,10 @@ python .\ais_monthly_app.py `
   --input "D:\AIS\D&TMOK KLNG_2026_04" `
   --output "D:\AIS\KLNG 2026年4月 32方位數值_新版自動分析.xlsx" `
   --legacy-output "D:\AIS\KLNG 2026年4月 32方位數值_原格式相容版.xlsx" `
-  --year 2026 --month 4 --workers 2 --overwrite
+  --workers 2 --overwrite
 ```
+
+命令列也會從檔名自動判定年月；`--year` 與 `--month` 僅保留給同一資料夾含多個月份時的相容用法。
 
 ## 測試
 

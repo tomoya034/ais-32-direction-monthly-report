@@ -3,18 +3,25 @@ from __future__ import annotations
 import tempfile
 import unittest
 import shutil
+import sys
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 import openpyxl
 
 from ais_monthly_app import (
     AppConfig,
     Candidate,
+    default_output_directory,
+    default_worker_count,
     derive_legacy_output_path,
     degree_to_direction_index,
     friendly_error_message,
+    month_option_label,
     parse_source_date,
+    process_source_file,
+    resolve_source_month,
     run_pipeline,
     select_cluster,
     select_cluster_from_sorted_rows,
@@ -25,6 +32,23 @@ class RuleTests(unittest.TestCase):
     def test_filename_date_uses_yyyymmdd_component(self) -> None:
         self.assertEqual(parse_source_date("D&TMOK KLNG_20260401_23.xlsx"), date(2026, 4, 1))
         self.assertIsNone(parse_source_date("KLNG_20260401.xlsx"))
+
+    def test_month_is_derived_from_fixed_filenames_without_manual_input(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            (folder / "D&TMOK KLNG_20260401_23.xlsx").touch()
+            (folder / "D&TMOK KLNG_20260402_23.xlsx").touch()
+            (folder / "D&TMOK KLNG_20260501_23.xlsx").touch()
+            self.assertEqual(resolve_source_month(folder), (2026, 5, 1))
+            self.assertEqual(resolve_source_month(folder, 2026, 4), (2026, 4, 2))
+            self.assertEqual(month_option_label(2026, 4, 2), "2026 年 4 月（2 個每日檔）")
+
+    def test_requested_month_must_exist_in_source_filenames(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            (folder / "D&TMOK KLNG_20260401_23.xlsx").touch()
+            with self.assertRaisesRegex(ValueError, "檔名中沒有"):
+                resolve_source_month(folder, 2026, 5)
 
     def test_direction_mapping_matches_existing_script_bins(self) -> None:
         self.assertEqual(degree_to_direction_index(0)[0], 0)
@@ -63,6 +87,53 @@ class RuleTests(unittest.TestCase):
         modern = Path("KLNG 2026年4月 32方位數值_新版自動分析.xlsx")
         self.assertEqual(derive_legacy_output_path(modern).name, "KLNG 2026年4月 32方位數值_原格式相容版.xlsx")
         self.assertIn("Excel", friendly_error_message(PermissionError("locked")))
+
+    def test_frozen_default_output_stays_beside_portable_exe(self) -> None:
+        fake_executable = Path("B:/AIS/AIS_32方位月報工具/AIS_32方位月報工具.exe")
+        with (
+            mock.patch.object(sys, "frozen", True, create=True),
+            mock.patch.object(sys, "executable", str(fake_executable)),
+        ):
+            self.assertEqual(
+                default_output_directory(),
+                fake_executable.resolve().parent / "output" / "AIS月報",
+            )
+
+    def test_default_workers_are_bounded_for_desktop_use(self) -> None:
+        with mock.patch("ais_monthly_app.os.cpu_count", return_value=24):
+            self.assertEqual(default_worker_count(), 3)
+        with mock.patch("ais_monthly_app.os.cpu_count", return_value=1):
+            self.assertEqual(default_worker_count(), 1)
+        with mock.patch("ais_monthly_app.os.cpu_count", return_value=None):
+            self.assertEqual(default_worker_count(), 1)
+
+    def test_ais_sheet_is_found_after_a_cover_sheet(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260401_23.xlsx"
+            workbook = openpyxl.Workbook()
+            cover = workbook.active
+            cover.title = "說明"
+            cover.append(["這不是 AIS 資料表"])
+            sheet = workbook.create_sheet("AIS")
+            sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+            sheet.append([1, "East", 0.0, 80.0])
+            sheet.append([2, "East", 0.0, 79.0])
+            sheet.append([3, "East", 0.0, 78.0])
+            workbook.save(source)
+
+            result = process_source_file(
+                source,
+                date(2026, 4, 1),
+                AppConfig(
+                    input_dir=folder,
+                    output_path=folder / "result.xlsx",
+                    year=2026,
+                    month=4,
+                ),
+            )
+            self.assertEqual(result.rows_accepted, 3)
+            self.assertEqual(result.directions["北"].selected, 80.0)
 
 
 class EndToEndTests(unittest.TestCase):

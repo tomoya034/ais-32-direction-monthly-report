@@ -215,6 +215,7 @@ class AppConfig:
     year: int
     month: int
     legacy_output_path: Path | None = None
+    delivery_dir: Path | None = None
     max_distance: float = 500.0
     tolerance: float = 0.10
     cluster_size: int = 3
@@ -273,6 +274,25 @@ class ProcessingJob:
             (day_input.day, fragment.path)
             for day_input in self.days
             for fragment in day_input.fragments
+        )
+
+
+@dataclass(frozen=True)
+class DeliveryPaths:
+    root: Path
+    period_a_full: Path
+    period_b_full: Path
+    period_a_summary: Path
+    period_b_summary: Path
+    integrated_summary: Path
+
+    def all_files(self) -> tuple[Path, ...]:
+        return (
+            self.period_a_full,
+            self.period_b_full,
+            self.period_a_summary,
+            self.period_b_summary,
+            self.integrated_summary,
         )
 
 
@@ -2622,6 +2642,439 @@ def write_legacy_workbook(
         raise
     emit(callback, kind="legacy_write_done", file=output_path.name)
     return output_path
+
+
+def derive_delivery_paths(config: AppConfig, root: Path | None = None) -> DeliveryPaths:
+    delivery_root = root or config.delivery_dir or (
+        config.output_path.parent / "正式交付" / f"{config.port}_{config.year}{config.month:02d}"
+    )
+    base = f"{config.port} {config.month}月 32方位數值"
+    return DeliveryPaths(
+        root=delivery_root,
+        period_a_full=delivery_root / f"{base}_2.xlsx",
+        period_b_full=delivery_root / f"{base}.xlsx",
+        period_a_summary=delivery_root / f"{base}_2 總表.xlsx",
+        period_b_summary=delivery_root / f"{base} 總表.xlsx",
+        integrated_summary=delivery_root
+        / f"{config.port}_{config.month}月_32方位_每日較大值整合總表.xlsx",
+    )
+
+
+def _period_values(
+    snapshot: DecisionSnapshot,
+    day_results: Sequence[DayResult],
+    scope: str,
+) -> dict[tuple[date, str], float | None]:
+    resolved = resolve_decision_values(snapshot, day_results)
+    return {
+        (day_result.day, direction): resolved.get((scope, day_result.day, direction))
+        for day_result in day_results
+        for direction in DIRECTION_ORDER
+    }
+
+
+def _integrated_period_values(
+    day_results: Sequence[DayResult],
+    period_a: dict[tuple[date, str], float | None],
+    period_b: dict[tuple[date, str], float | None],
+) -> dict[tuple[date, str], float | None]:
+    integrated: dict[tuple[date, str], float | None] = {}
+    for day_result in day_results:
+        for direction in DIRECTION_ORDER:
+            values = [
+                value
+                for value in (
+                    period_a.get((day_result.day, direction)),
+                    period_b.get((day_result.day, direction)),
+                )
+                if value is not None
+            ]
+            integrated[(day_result.day, direction)] = max(values) if values else None
+    return integrated
+
+
+def _add_legacy_charts(
+    workbook: xlsxwriter.Workbook,
+    sheet: object,
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+    values: dict[tuple[date, str], float | None],
+    stat_start: int,
+) -> None:
+    radar = workbook.add_chart({"type": "radar"})
+    palette = ["#4472C4", "#ED7D31", "#70AD47", "#A5A5A5", "#FFC000", "#5B9BD5"]
+    for day_offset, day_result in enumerate(day_results):
+        row = 1 + day_offset
+        radar.add_series(
+            {
+                "name": f"{config.month}月{day_result.day.day}日",
+                "categories": ["總表", 0, 1, 0, 32],
+                "values": ["總表", row, 1, row, 32],
+                "line": {
+                    "color": palette[day_offset % len(palette)],
+                    "width": 0.75,
+                    "transparency": 35,
+                },
+            }
+        )
+    radar.set_title({"name": f"{config.year}-{config.month:02d} AIS通訊涵蓋圖"})
+    radar.set_legend({"position": "right", "font": {"size": 8}})
+    radar.set_size({"width": 760, "height": 480})
+    sheet.insert_chart(stat_start + 6, 0, radar)
+
+    helper_column = 34
+    sheet.write(0, helper_column, "海向方位")
+    sheet.write_row(0, helper_column + 1, ["MAX", "MIN", "AVERAGE"])
+    stat_values = {
+        direction: _stats(
+            values.get((day_result.day, direction)) for day_result in day_results
+        )
+        for direction in DIRECTION_ORDER
+    }
+    for helper_row, direction_index in enumerate(OPEN_SEA_INDEXES, start=1):
+        direction = DIRECTION_ORDER[direction_index]
+        sheet.write(helper_row, helper_column, LEGACY_DIRECTION_ABBREVIATIONS[direction_index])
+        for offset in range(3):
+            value = stat_values[direction][offset]
+            if value is not None:
+                sheet.write_number(helper_row, helper_column + 1 + offset, value)
+    sheet.set_column(helper_column, helper_column + 3, None, None, {"hidden": True})
+
+    columns = workbook.add_chart({"type": "column"})
+    categories = ["總表", 1, helper_column, len(OPEN_SEA_INDEXES), helper_column]
+    for label, helper_offset, color in (
+        ("最遠距離", 1, "#4472C4"),
+        ("最近距離", 2, "#ED7D31"),
+    ):
+        columns.add_series(
+            {
+                "name": label,
+                "categories": categories,
+                "values": [
+                    "總表",
+                    1,
+                    helper_column + helper_offset,
+                    len(OPEN_SEA_INDEXES),
+                    helper_column + helper_offset,
+                ],
+                "fill": {"color": color},
+                "border": {"none": True},
+            }
+        )
+    line = workbook.add_chart({"type": "line"})
+    line.add_series(
+        {
+            "name": "平均值",
+            "categories": categories,
+            "values": [
+                "總表",
+                1,
+                helper_column + 3,
+                len(OPEN_SEA_INDEXES),
+                helper_column + 3,
+            ],
+            "line": {"color": "#70AD47", "width": 2.0},
+        }
+    )
+    columns.combine(line)
+    columns.set_title({"name": f"{config.year}-{config.month:02d} AIS通訊最遠、最近與平均距離（NM）"})
+    columns.set_legend({"position": "bottom"})
+    columns.set_y_axis({"name": "NM", "num_format": "0"})
+    columns.set_size({"width": 760, "height": 480})
+    sheet.insert_chart(stat_start + 31, 0, columns)
+
+
+def _write_delivery_summary_sheet(
+    workbook: xlsxwriter.Workbook,
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+    values: dict[tuple[date, str], float | None],
+    *,
+    daily_names: dict[date, str] | None = None,
+    integrated_formula: bool = False,
+) -> None:
+    sheet = workbook.add_worksheet("總表")
+    sheet.freeze_panes(1, 1)
+    sheet.set_column("A:A", 11)
+    sheet.set_column("B:AG", 10)
+    header_format = workbook.add_format({"bold": True, "align": "center", "bottom": 1})
+    number_format = workbook.add_format({"num_format": "0.000"})
+    date_format = workbook.add_format({"num_format": "m月d日"})
+    stat_label = workbook.add_format({"bold": True})
+    sheet.write_row(0, 1, LEGACY_DIRECTION_ABBREVIATIONS, header_format)
+    for row, day_result in enumerate(day_results, start=1):
+        sheet.write_datetime(row, 0, datetime.combine(day_result.day, datetime.min.time()), date_format)
+        for direction_index, direction in enumerate(DIRECTION_ORDER):
+            column = 1 + direction_index
+            value = values.get((day_result.day, direction))
+            if direction_index not in OPEN_SEA_INDEXES:
+                sheet.write_blank(row, column, None, number_format)
+            elif integrated_formula:
+                excel_row = row + 1
+                column_name = _excel_col(column)
+                formula = (
+                    f'=IF(COUNT(\'Period A\'!{column_name}{excel_row},\'Period B\'!{column_name}{excel_row})=0,"",'
+                    f'MAX(\'Period A\'!{column_name}{excel_row},\'Period B\'!{column_name}{excel_row}))'
+                )
+                sheet.write_formula(row, column, formula, number_format, value if value is not None else "")
+            elif daily_names is not None:
+                source_column = _excel_col(7 + direction_index)
+                formula = f"=IFERROR('{daily_names[day_result.day]}'!{source_column}2,\"\")"
+                sheet.write_formula(row, column, formula, number_format, value if value is not None else "")
+            elif value is None:
+                sheet.write_blank(row, column, None, number_format)
+            else:
+                sheet.write_number(row, column, value, number_format)
+
+    stat_start = len(day_results) + 2
+    stat_specs = [("MAX", "MAX", 0), ("MIN", "MIN", 1), ("平均值", "AVERAGE", 2), ("標準差", "STDEV.S", 3)]
+    stats_by_direction = {
+        direction: _stats(values.get((item.day, direction)) for item in day_results)
+        for direction in DIRECTION_ORDER
+    }
+    for offset, (label, function, stat_index) in enumerate(stat_specs):
+        row = stat_start + offset
+        sheet.write(row, 0, label, stat_label)
+        for direction_index, direction in enumerate(DIRECTION_ORDER):
+            column = 1 + direction_index
+            if direction_index not in OPEN_SEA_INDEXES:
+                sheet.write_blank(row, column, None, number_format)
+                continue
+            column_name = _excel_col(column)
+            formula = f'=IFERROR({function}({column_name}2:{column_name}{len(day_results) + 1}),"")'
+            cached = stats_by_direction[direction][stat_index]
+            sheet.write_formula(row, column, formula, number_format, cached if cached is not None else "")
+    _add_legacy_charts(workbook, sheet, config, day_results, values, stat_start)
+
+
+def _write_period_full_workbook(
+    path: Path,
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+    scope: str,
+    values: dict[tuple[date, str], float | None],
+    cancel_event: threading.Event | None,
+) -> None:
+    workbook = xlsxwriter.Workbook(
+        path,
+        {"constant_memory": True, "nan_inf_to_errors": True, "default_date_format": "m月d日"},
+    )
+    workbook.use_zip64()
+    workbook.set_calc_mode("auto")
+    workbook.set_properties(
+        {
+            "title": f"{config.port} {config.year}年{config.month}月 {scope} 32方位數值",
+            "subject": "歷史交付格式；period 由儲存時間定義",
+            "author": APP_TITLE,
+        }
+    )
+    header_format = workbook.add_format({"bold": True, "align": "center", "bottom": 1})
+    number_format = workbook.add_format({"num_format": "0.000"})
+    daily_names: dict[date, str] = {}
+    try:
+        for day_result in day_results:
+            if cancel_event and cancel_event.is_set():
+                raise CancelledError("使用者已取消")
+            sheet_name = _safe_sheet_name(f"{config.month}月{day_result.day.day}日")
+            daily_names[day_result.day] = sheet_name
+            sheet = workbook.add_worksheet(sheet_name)
+            sheet.freeze_panes(1, 0)
+            sheet.set_column("A:A", 14)
+            sheet.set_column("B:B", 12)
+            sheet.set_column("C:C", 11)
+            sheet.set_column("D:G", 3)
+            sheet.set_column("H:AM", 11)
+            sheet.write_row(0, 0, ["DISTANCE", "DEGREE", "方位"], header_format)
+            sheet.write_row(0, 7, DIRECTION_ORDER, header_format)
+            for direction_index, direction in enumerate(DIRECTION_ORDER):
+                if direction_index not in OPEN_SEA_INDEXES:
+                    continue
+                final_value = values.get((day_result.day, direction))
+                excel_column = _excel_col(7 + direction_index)
+                formula = (
+                    f'=IF(COUNTIF($C:$C,{excel_column}$1)=0,"",'
+                    f'MAXIFS($A:$A,$C:$C,{excel_column}$1))'
+                )
+                sheet.write_formula(
+                    1,
+                    7 + direction_index,
+                    formula,
+                    number_format,
+                    final_value if final_value is not None else "",
+                )
+
+            maxima: dict[str, float] = {}
+            excel_row = 1
+            spool_path = _normalized_spool_path(config, day_result.day)
+            if day_result.source_fragments:
+                if not spool_path.is_file():
+                    raise FileNotFoundError(f"缺少 {day_result.day} normalized spool。")
+                if day_result.spool_sha256 and _file_sha256(spool_path) != day_result.spool_sha256:
+                    raise ValueError(f"{day_result.day} normalized spool checksum 不符。")
+                _counts, records = read_normalized_spool(spool_path)
+                for direction_index, record in records:
+                    if record.msg_type not in HISTORICAL_MESSAGE_TYPES or record.period != scope:
+                        continue
+                    direction = DIRECTION_ORDER[direction_index]
+                    if direction_index in OPEN_SEA_INDEXES:
+                        final_value = values.get((day_result.day, direction))
+                        if final_value is None or record.distance > final_value + 1e-12:
+                            continue
+                    elif record.distance > config.max_distance:
+                        continue
+                    if excel_row > EXCEL_MAX_DATA_ROWS:
+                        raise SourceFileError(
+                            f"{day_result.day} {scope} retained detail 超過 Excel 上限 "
+                            f"{EXCEL_MAX_DATA_ROWS:,} 列；v1.5.0 不會截斷。"
+                        )
+                    sheet.write_number(excel_row, 0, record.distance)
+                    sheet.write_number(excel_row, 1, record.bearing)
+                    sheet.write(excel_row, 2, direction)
+                    maxima[direction] = max(maxima.get(direction, record.distance), record.distance)
+                    excel_row += 1
+            for direction_index in OPEN_SEA_INDEXES:
+                direction = DIRECTION_ORDER[direction_index]
+                final_value = values.get((day_result.day, direction))
+                detail_max = maxima.get(direction)
+                if final_value is None:
+                    if detail_max is not None:
+                        raise AssertionError("blank period decision retained detail rows")
+                elif detail_max is None or not math.isclose(
+                    detail_max, final_value, rel_tol=0.0, abs_tol=1e-9
+                ):
+                    raise AssertionError(
+                        f"Period detail MAX != period final: {day_result.day} {scope} {direction} "
+                        f"{detail_max} != {final_value}"
+                    )
+
+        _write_delivery_summary_sheet(
+            workbook, config, day_results, values, daily_names=daily_names
+        )
+        mapping = workbook.add_worksheet("工作")
+        mapping.write_row(0, 9, ["POSITION", "方位"], header_format)
+        for degree in range(361):
+            direction_info = degree_to_direction_index(degree)
+            mapping.write_number(degree + 1, 9, degree)
+            mapping.write(degree + 1, 10, DIRECTION_ORDER[direction_info[0]] if direction_info else "")
+        mapping.hide()
+        workbook.close()
+    except Exception:
+        try:
+            workbook.close()
+        except Exception:
+            pass
+        raise
+
+
+def _write_summary_workbook(
+    path: Path,
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+    values: dict[tuple[date, str], float | None],
+    *,
+    integrated_inputs: tuple[
+        dict[tuple[date, str], float | None],
+        dict[tuple[date, str], float | None],
+    ]
+    | None = None,
+) -> None:
+    workbook = xlsxwriter.Workbook(path, {"nan_inf_to_errors": True})
+    workbook.set_calc_mode("auto")
+    if integrated_inputs is not None:
+        for sheet_name, source_values in zip(("Period A", "Period B"), integrated_inputs):
+            source = workbook.add_worksheet(sheet_name)
+            source.write_row(0, 1, LEGACY_DIRECTION_ABBREVIATIONS)
+            for row, day_result in enumerate(day_results, start=1):
+                source.write_datetime(row, 0, datetime.combine(day_result.day, datetime.min.time()))
+                for direction_index, direction in enumerate(DIRECTION_ORDER):
+                    value = source_values.get((day_result.day, direction))
+                    if value is not None:
+                        source.write_number(row, 1 + direction_index, value)
+            source.hide()
+    _write_delivery_summary_sheet(
+        workbook,
+        config,
+        day_results,
+        values,
+        integrated_formula=integrated_inputs is not None,
+    )
+    workbook.close()
+
+
+def write_delivery_workbooks(
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+    snapshot: DecisionSnapshot,
+    *,
+    root: Path | None = None,
+    callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> DeliveryPaths:
+    paths = derive_delivery_paths(config, root)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    if not config.overwrite:
+        existing = [path for path in paths.all_files() if path.exists()]
+        if existing:
+            raise FileExistsError("正式交付檔已存在：" + "、".join(path.name for path in existing))
+    expected_manifest = source_manifest_hash(config, day_results)
+    if snapshot.source_manifest_hash != expected_manifest:
+        raise ValueError("決策 snapshot 與 normalized spool manifest 不一致。")
+    period_a = _period_values(snapshot, day_results, PERIOD_A)
+    period_b = _period_values(snapshot, day_results, PERIOD_B)
+    integrated = _integrated_period_values(day_results, period_a, period_b)
+
+    for day_result in day_results:
+        for direction_index, direction in enumerate(DIRECTION_ORDER):
+            left = period_a.get((day_result.day, direction))
+            right = period_b.get((day_result.day, direction))
+            actual = integrated.get((day_result.day, direction))
+            if direction_index not in OPEN_SEA_INDEXES:
+                if any(value is not None for value in (left, right, actual)):
+                    raise AssertionError("陸向交付格必須維持空白")
+                continue
+            expected = max(value for value in (left, right) if value is not None) if any(
+                value is not None for value in (left, right)
+            ) else None
+            if actual != expected:
+                raise AssertionError("integrated != MAX(period A, period B)")
+
+    temporary = {
+        path: path.with_name(path.stem + ".building.xlsx") for path in paths.all_files()
+    }
+    for temp_path in temporary.values():
+        temp_path.unlink(missing_ok=True)
+    try:
+        emit(callback, kind="delivery_write_start", files=[path.name for path in paths.all_files()])
+        _write_period_full_workbook(
+            temporary[paths.period_b_full], config, day_results, PERIOD_B, period_b, cancel_event
+        )
+        _write_period_full_workbook(
+            temporary[paths.period_a_full], config, day_results, PERIOD_A, period_a, cancel_event
+        )
+        _write_summary_workbook(
+            temporary[paths.period_b_summary], config, day_results, period_b
+        )
+        _write_summary_workbook(
+            temporary[paths.period_a_summary], config, day_results, period_a
+        )
+        _write_summary_workbook(
+            temporary[paths.integrated_summary],
+            config,
+            day_results,
+            integrated,
+            integrated_inputs=(period_a, period_b),
+        )
+        for final_path in paths.all_files():
+            os.replace(temporary[final_path], final_path)
+    except Exception:
+        for temp_path in temporary.values():
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    emit(callback, kind="delivery_write_done", files=[str(path) for path in paths.all_files()])
+    return paths
 
 
 def run_pipeline(

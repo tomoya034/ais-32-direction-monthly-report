@@ -31,6 +31,7 @@ from ais_monthly_app import (
     scan_source_files,
     select_cluster_from_sorted_rows,
     source_manifest_hash,
+    write_delivery_workbooks,
     write_monthly_workbook,
 )
 
@@ -416,6 +417,120 @@ class ReviewLedgerTests(unittest.TestCase):
             workbook.close()
             with self.assertRaisesRegex(ValueError, "Final value 公式已遭破壞"):
                 read_review_decisions(broken_formula)
+
+    def test_five_delivery_workbooks_share_one_snapshot_and_keep_max_contracts(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_any.xlsx"
+            FragmentCatalogTests._write_records(
+                source,
+                [
+                    (1, 0, "A", 1, 50.0),
+                    (1, 1, "A", 1, 49.0),
+                    (1, 2, "B", 1, 48.0),
+                    (13, 0, "A", 3, 70.0),
+                    (13, 1, "A", 3, 69.0),
+                    (13, 2, "B", 3, 68.0),
+                    (13, 3, "A", 2, 900.0),
+                ],
+            )
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "ANY", source)
+            config = AppConfig(
+                folder,
+                folder / "analysis.xlsx",
+                "KLNG",
+                2026,
+                6,
+                overwrite=True,
+            )
+            result = process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+            snapshot = build_default_decision_snapshot(config, [result])
+            paths = write_delivery_workbooks(
+                config,
+                [result],
+                snapshot,
+                root=folder / "delivery",
+            )
+            self.assertEqual(len(paths.all_files()), 5)
+            self.assertTrue(all(path.is_file() for path in paths.all_files()))
+
+            def cell(path: Path, sheet: str, coordinate: str):
+                workbook = openpyxl.load_workbook(path, read_only=False, data_only=True)
+                try:
+                    return workbook[sheet][coordinate].value
+                finally:
+                    workbook.close()
+
+            self.assertEqual(cell(paths.period_a_full, "總表", "B2"), 50.0)
+            self.assertEqual(cell(paths.period_a_summary, "總表", "B2"), 50.0)
+            self.assertEqual(cell(paths.period_b_full, "總表", "B2"), 70.0)
+            self.assertEqual(cell(paths.period_b_summary, "總表", "B2"), 70.0)
+            self.assertEqual(cell(paths.integrated_summary, "總表", "B2"), 70.0)
+
+            workbook = openpyxl.load_workbook(paths.period_a_full, read_only=True, data_only=True)
+            try:
+                retained = [
+                    row[0]
+                    for row in workbook["6月1日"].iter_rows(min_row=2, max_col=3, values_only=True)
+                    if row[2] == "北"
+                ]
+                self.assertEqual(max(retained), cell(paths.period_a_full, "6月1日", "H2"))
+                self.assertNotIn(900.0, retained)
+            finally:
+                workbook.close()
+
+            formulas = openpyxl.load_workbook(paths.integrated_summary, read_only=False, data_only=False)
+            try:
+                self.assertIn("MAX('Period A'!B2,'Period B'!B2)", formulas["總表"]["B2"].value)
+                self.assertEqual(len(formulas["總表"]._charts), 2)
+            finally:
+                formulas.close()
+
+            decisions = list(snapshot.decisions)
+            for index, decision in enumerate(decisions):
+                if (
+                    decision.scope == PERIOD_A
+                    and decision.day == dt.date(2026, 6, 1)
+                    and decision.direction == "北"
+                ):
+                    decisions[index] = type(decision)(
+                        decision.scope,
+                        decision.day,
+                        decision.direction,
+                        None,
+                        None,
+                        "blank means suppress retained detail",
+                    )
+                    break
+            blank_snapshot = type(snapshot)(
+                snapshot.port,
+                snapshot.year,
+                snapshot.month,
+                snapshot.source_manifest_hash,
+                tuple(decisions),
+            )
+            blank_paths = write_delivery_workbooks(
+                config,
+                [result],
+                blank_snapshot,
+                root=folder / "blank_delivery",
+            )
+            self.assertIsNone(cell(blank_paths.period_a_summary, "總表", "B2"))
+            self.assertEqual(cell(blank_paths.integrated_summary, "總表", "B2"), 70.0)
+            workbook = openpyxl.load_workbook(blank_paths.period_a_full, read_only=True, data_only=True)
+            try:
+                self.assertFalse(
+                    any(
+                        row[2] == "北"
+                        for row in workbook["6月1日"].iter_rows(
+                            min_row=2, max_col=3, values_only=True
+                        )
+                    )
+                )
+            finally:
+                workbook.close()
 
 
 class ExternalJuneContractTests(unittest.TestCase):

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import calendar
 import concurrent.futures
-import heapq
 import json
 import math
 import multiprocessing
@@ -833,10 +832,7 @@ def process_day_input(
 ) -> DayResult:
     parsed_day = day_input.day
     started = time.perf_counter()
-    heaps: list[list[tuple[float, int, float]]] = [[] for _ in DIRECTION_ORDER]
-    legacy_rows: list[list[tuple[float, int, float]]] | None = (
-        [[] for _ in DIRECTION_ORDER] if config.legacy_output_path is not None else None
-    )
+    all_rows: list[list[tuple[float, int, float]]] = [[] for _ in DIRECTION_ORDER]
     over_cap_counts = [0] * len(DIRECTION_ORDER)
     over_cap_maxes: list[float | None] = [None] * len(DIRECTION_ORDER)
     result = DayResult(
@@ -888,14 +884,14 @@ def process_day_input(
 
                 direction_index, normalized_bearing = direction_info
                 source_key = (fragment_index << 32) | excel_row
-                if legacy_rows is not None:
+                all_rows[direction_index].append((distance, source_key, normalized_bearing))
+                if config.legacy_output_path is not None:
                     result.rows_legacy += 1
                     if result.rows_legacy > EXCEL_MAX_DATA_ROWS:
                         raise SourceFileError(
                             f"{parsed_day:%Y-%m-%d} 合併後符合舊格式的資料超過 Excel 單張工作表上限 "
                             f"{EXCEL_MAX_DATA_ROWS:,} 列。"
                         )
-                    legacy_rows[direction_index].append((distance, source_key, normalized_bearing))
                 if distance > config.max_distance:
                     over_cap_counts[direction_index] += 1
                     prior_max = over_cap_maxes[direction_index]
@@ -904,12 +900,6 @@ def process_day_input(
                     continue
 
                 result.rows_accepted += 1
-                heap = heaps[direction_index]
-                item = (distance, source_key, normalized_bearing)
-                if len(heap) < config.top_candidates:
-                    heapq.heappush(heap, item)
-                elif item[0] > heap[0][0]:
-                    heapq.heapreplace(heap, item)
 
                 if excel_row % 100000 == 0:
                     emit(
@@ -922,34 +912,17 @@ def process_day_input(
         finally:
             workbook.close()
 
-    if legacy_rows is not None:
-        for index, direction in enumerate(DIRECTION_ORDER):
-            legacy_rows[index].sort(key=lambda item: (-item[0], item[1]))
-            result.directions[direction] = select_cluster_from_sorted_rows(
-                direction=direction,
-                rows=legacy_rows[index],
-                config=config,
-                over_cap_count=over_cap_counts[index],
-                over_cap_max=over_cap_maxes[index],
-            )
-        write_legacy_spool(config, parsed_day, legacy_rows, presorted=True)
-    else:
-        for index, direction in enumerate(DIRECTION_ORDER):
-            ordered = [
-                Candidate(distance=item[0], source_row=item[1], bearing=item[2], rank=rank)
-                for rank, item in enumerate(
-                    sorted(heaps[index], key=lambda value: (-value[0], value[1])),
-                    start=1,
-                )
-            ]
-            result.directions[direction] = select_cluster(
-                direction=direction,
-                candidates=ordered,
-                tolerance=config.tolerance,
-                cluster_size=config.cluster_size,
-                over_cap_count=over_cap_counts[index],
-                over_cap_max=over_cap_maxes[index],
-            )
+    for index, direction in enumerate(DIRECTION_ORDER):
+        all_rows[index].sort(key=lambda item: (-item[0], item[1]))
+        result.directions[direction] = select_cluster_from_sorted_rows(
+            direction=direction,
+            rows=all_rows[index],
+            config=config,
+            over_cap_count=over_cap_counts[index],
+            over_cap_max=over_cap_maxes[index],
+        )
+    if config.legacy_output_path is not None:
+        write_legacy_spool(config, parsed_day, all_rows, presorted=True)
 
     result.elapsed_seconds = time.perf_counter() - started
     return result

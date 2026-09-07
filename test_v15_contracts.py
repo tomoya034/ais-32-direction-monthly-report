@@ -138,6 +138,45 @@ class FragmentCatalogTests(unittest.TestCase):
             self.assertEqual(len(job.days[0].fragments), 2)
             self.assertEqual(len(job.files), 2)
 
+    def test_pipeline_selector_is_independent_of_legacy_output_and_display_limit(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_fragment.xlsx"
+            self._write_fragment(source, [100.0, 80.0, 60.0, 40.0, 20.0, 19.0, 18.0])
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "FRAGMENT", source)
+            day_input = DayInput("KLNG", dt.date(2026, 6, 1), (fragment,))
+            common = dict(
+                input_dir=folder,
+                port="KLNG",
+                year=2026,
+                month=6,
+                top_candidates=3,
+            )
+            modern_only = process_day_input(
+                day_input,
+                AppConfig(output_path=folder / "modern.xlsx", **common),
+            )
+            with_legacy = process_day_input(
+                day_input,
+                AppConfig(
+                    output_path=folder / "both.xlsx",
+                    legacy_output_path=folder / "legacy.xlsx",
+                    **common,
+                ),
+            )
+            first = modern_only.directions["北"]
+            second = with_legacy.directions["北"]
+            self.assertEqual(
+                (first.selected, first.selected_rank, first.cluster_count),
+                (20.0, 5, 3),
+            )
+            self.assertEqual(
+                (second.selected, second.selected_rank, second.cluster_count),
+                (first.selected, first.selected_rank, first.cluster_count),
+            )
+
 
 class ExternalJuneContractTests(unittest.TestCase):
     def test_period_candidate_contract_gate_artifact(self) -> None:

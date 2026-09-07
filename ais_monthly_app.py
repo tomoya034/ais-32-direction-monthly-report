@@ -39,6 +39,8 @@ NORMALIZED_COUNTS = struct.Struct("<32Q")
 HISTORICAL_MESSAGE_TYPES = (1, 3, 4, 18, 19)
 PERIOD_A = "period_a"
 PERIOD_B = "period_b"
+LOGICAL_DAY = "logical_day"
+REVIEW_WORKBOOK_SCHEMA = "AIS_V15_REVIEW_1"
 
 DIRECTION_ORDER = [
     "北", "北微東", "北北東", "東北微北", "東北", "東北微東", "東北東", "東微北", "東",
@@ -178,6 +180,31 @@ class DayResult:
     def source_file(self) -> Path | None:
         """Deprecated single-file view; multi-fragment days deliberately return None."""
         return self.source_fragments[0] if len(self.source_fragments) == 1 else None
+
+
+@dataclass(frozen=True)
+class ReviewDecision:
+    scope: str
+    day: date
+    direction: str
+    candidate_id: str | None
+    forced_numeric: float | None = None
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class DecisionSnapshot:
+    port: str
+    year: int
+    month: int
+    source_manifest_hash: str
+    decisions: tuple[ReviewDecision, ...]
+
+    def by_key(self) -> dict[tuple[str, date, str], ReviewDecision]:
+        return {
+            (decision.scope, decision.day, decision.direction): decision
+            for decision in self.decisions
+        }
 
 
 @dataclass
@@ -1517,6 +1544,219 @@ def process_month(
     return output, warnings
 
 
+def _scope_directions(day_result: DayResult, scope: str) -> dict[str, DirectionResult]:
+    if scope == LOGICAL_DAY:
+        return day_result.directions
+    if scope in (PERIOD_A, PERIOD_B):
+        return day_result.period_directions.get(scope, {})
+    raise ValueError(f"未知的覆核 scope：{scope}")
+
+
+def source_manifest_hash(config: AppConfig, day_results: Sequence[DayResult]) -> str:
+    payload = {
+        "schema": REVIEW_WORKBOOK_SCHEMA,
+        "port": config.port,
+        "year": config.year,
+        "month": config.month,
+        "days": [
+            {
+                "day": result.day.isoformat(),
+                "spool_sha256": result.spool_sha256,
+                "fragments": [
+                    {
+                        "sha256": info.sha256,
+                        "sheet": info.sheet,
+                        "rows": info.rows_scanned,
+                    }
+                    for info in result.fragment_info
+                ],
+            }
+            for result in day_results
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def build_default_decision_snapshot(
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+) -> DecisionSnapshot:
+    decisions: list[ReviewDecision] = []
+    for day_result in day_results:
+        for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B):
+            directions = _scope_directions(day_result, scope)
+            for direction_index in OPEN_SEA_INDEXES:
+                direction = DIRECTION_ORDER[direction_index]
+                result = directions.get(direction, DirectionResult(direction=direction))
+                decisions.append(
+                    ReviewDecision(
+                        scope=scope,
+                        day=day_result.day,
+                        direction=direction,
+                        candidate_id=result.selected_candidate_id,
+                    )
+                )
+    return DecisionSnapshot(
+        port=config.port,
+        year=config.year,
+        month=config.month,
+        source_manifest_hash=source_manifest_hash(config, day_results),
+        decisions=tuple(decisions),
+    )
+
+
+def _display_candidate_catalog(
+    day_results: Sequence[DayResult],
+) -> dict[tuple[str, date, str], dict[str, Candidate]]:
+    catalog: dict[tuple[str, date, str], dict[str, Candidate]] = {}
+    for day_result in day_results:
+        for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B):
+            for direction, result in _scope_directions(day_result, scope).items():
+                key = (scope, day_result.day, direction)
+                catalog[key] = {
+                    candidate.candidate_id: candidate
+                    for candidate in result.candidates
+                    if candidate.candidate_id
+                }
+    return catalog
+
+
+def resolve_decision_values(
+    snapshot: DecisionSnapshot,
+    day_results: Sequence[DayResult],
+) -> dict[tuple[str, date, str], float | None]:
+    catalog = _display_candidate_catalog(day_results)
+    values: dict[tuple[str, date, str], float | None] = {}
+    for decision in snapshot.decisions:
+        key = (decision.scope, decision.day, decision.direction)
+        if decision.scope in (PERIOD_A, PERIOD_B) and decision.forced_numeric is not None:
+            raise ValueError(
+                f"{decision.day} {decision.scope} {decision.direction} 不允許任意 numeric override。"
+            )
+        if decision.scope == LOGICAL_DAY and decision.forced_numeric is not None:
+            if not math.isfinite(decision.forced_numeric) or decision.forced_numeric < 0:
+                raise ValueError(f"{decision.day} {decision.direction} 的 logical-day numeric override 無效。")
+            values[key] = decision.forced_numeric
+            continue
+        if not decision.candidate_id:
+            values[key] = None
+            continue
+        candidate = catalog.get(key, {}).get(decision.candidate_id)
+        if candidate is None:
+            raise ValueError(
+                f"{decision.day} {decision.scope} {decision.direction} 的 candidate ID "
+                f"{decision.candidate_id} 不在可驗證候選清單。"
+            )
+        values[key] = candidate.distance
+    return values
+
+
+def read_review_decisions(
+    workbook_path: Path,
+    *,
+    expected_manifest_hash: str | None = None,
+    candidate_catalog: dict[tuple[str, date, str], set[str]] | None = None,
+) -> DecisionSnapshot:
+    workbook = openpyxl.load_workbook(workbook_path, read_only=False, data_only=False)
+    try:
+        if "系統資料" not in workbook.sheetnames or "決策台帳" not in workbook.sheetnames:
+            raise ValueError("不是 v1.5.0 覆核 workbook：缺少系統資料或決策台帳。")
+        system = workbook["系統資料"]
+        metadata = {
+            str(system.cell(row=row, column=1).value): system.cell(row=row, column=2).value
+            for row in range(1, system.max_row + 1)
+        }
+        if metadata.get("Schema") != REVIEW_WORKBOOK_SCHEMA:
+            raise ValueError("覆核 workbook schema 版本不相容。")
+        manifest_hash = str(metadata.get("Source manifest SHA-256", ""))
+        if expected_manifest_hash is not None and manifest_hash != expected_manifest_hash:
+            raise ValueError("來源 fragment manifest 已變更；不可沿用舊覆核決策。")
+        port = normalize_port(str(metadata.get("Port", "")))
+        period = str(metadata.get("Period", ""))
+        match = re.fullmatch(r"(\d{4})-(\d{2})", period)
+        if match is None:
+            raise ValueError("覆核 workbook 的 Period metadata 無效。")
+        year, month = map(int, match.groups())
+
+        ledger = workbook["決策台帳"]
+        expected_headers = [
+            "Scope",
+            "日期",
+            "方位",
+            "自動 Candidate ID",
+            "自動值",
+            "決策 Candidate ID",
+            "Forced numeric override",
+            "Final value",
+            "狀態",
+            "備註",
+        ]
+        actual_headers = [ledger.cell(row=1, column=index).value for index in range(1, 11)]
+        if actual_headers != expected_headers:
+            raise ValueError("決策台帳欄位已被變更，無法安全 finalization。")
+        decisions: list[ReviewDecision] = []
+        seen: set[tuple[str, date, str]] = set()
+        for row in range(2, ledger.max_row + 1):
+            scope_value = ledger.cell(row=row, column=1).value
+            if scope_value is None:
+                continue
+            scope = str(scope_value)
+            if scope not in (LOGICAL_DAY, PERIOD_A, PERIOD_B):
+                raise ValueError(f"決策台帳 A{row} 的 scope 無效：{scope}")
+            raw_day = ledger.cell(row=row, column=2).value
+            if isinstance(raw_day, datetime):
+                parsed_day = raw_day.date()
+            elif isinstance(raw_day, date):
+                parsed_day = raw_day
+            else:
+                raise ValueError(f"決策台帳 B{row} 的日期無效。")
+            direction = str(ledger.cell(row=row, column=3).value)
+            if direction not in OPEN_SEA_DIRECTIONS:
+                raise ValueError(f"決策台帳 C{row} 的方位不在 21 個海向內。")
+            key = (scope, parsed_day, direction)
+            if key in seen:
+                raise ValueError(f"決策台帳第 {row} 列與前列重複：{key}")
+            seen.add(key)
+            raw_candidate = ledger.cell(row=row, column=6).value
+            candidate_id = str(raw_candidate).strip() if raw_candidate not in (None, "") else None
+            raw_forced = ledger.cell(row=row, column=7).value
+            if raw_forced in (None, ""):
+                forced_numeric = None
+            elif isinstance(raw_forced, (int, float)) and math.isfinite(float(raw_forced)):
+                forced_numeric = float(raw_forced)
+            else:
+                raise ValueError(f"決策台帳 G{row} 的 forced numeric override 無效。")
+            if scope in (PERIOD_A, PERIOD_B) and forced_numeric is not None:
+                raise ValueError(f"決策台帳 G{row}：Period A/B 不允許 numeric override。")
+            if candidate_catalog is not None and candidate_id:
+                if candidate_id not in candidate_catalog.get(key, set()):
+                    raise ValueError(f"決策台帳 F{row} 的 candidate ID 不屬於該 day/period/direction。")
+            final_formula = ledger.cell(row=row, column=8).value
+            if not isinstance(final_formula, str) or not final_formula.startswith("="):
+                raise ValueError(f"決策台帳 H{row} 的 Final value 公式已遭破壞。")
+            note_value = ledger.cell(row=row, column=10).value
+            decisions.append(
+                ReviewDecision(
+                    scope=scope,
+                    day=parsed_day,
+                    direction=direction,
+                    candidate_id=candidate_id,
+                    forced_numeric=forced_numeric,
+                    note="" if note_value is None else str(note_value),
+                )
+            )
+        return DecisionSnapshot(
+            port=port,
+            year=year,
+            month=month,
+            source_manifest_hash=manifest_hash,
+            decisions=tuple(decisions),
+        )
+    finally:
+        workbook.close()
+
+
 def _excel_col(column_zero_based: int) -> str:
     value = column_zero_based + 1
     letters = ""
@@ -1548,9 +1788,28 @@ def write_monthly_workbook(
     config: AppConfig,
     day_results: list[DayResult],
     warnings: list[str],
+    decision_snapshot: DecisionSnapshot | None = None,
     callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
+    if decision_snapshot is None:
+        decision_snapshot = build_default_decision_snapshot(config, day_results)
+    if (
+        decision_snapshot.port != config.port
+        or decision_snapshot.year != config.year
+        or decision_snapshot.month != config.month
+    ):
+        raise ValueError("決策 snapshot 與目前港別／月份不一致。")
+    expected_manifest = source_manifest_hash(config, day_results)
+    if decision_snapshot.source_manifest_hash != expected_manifest:
+        raise ValueError("決策 snapshot 的來源 fragment manifest 不一致。")
+    decision_values = resolve_decision_values(decision_snapshot, day_results)
+    decisions_by_key = decision_snapshot.by_key()
+    warnings = list(warnings) + [
+        f"{day_result.day:%Y-%m-%d}：{diagnostic}"
+        for day_result in day_results
+        for diagnostic in day_result.diagnostics
+    ]
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = config.output_path.with_name(config.output_path.stem + ".building.xlsx")
     if temp_path.exists():
@@ -1592,6 +1851,7 @@ def write_monthly_workbook(
         "number": workbook.add_format({"font_name": "Microsoft JhengHei", "font_size": 10, "num_format": "0.000", "align": "right"}),
         "integer": workbook.add_format({"font_name": "Microsoft JhengHei", "font_size": 10, "num_format": "#,##0", "align": "right"}),
         "date": workbook.add_format({"font_name": "Microsoft JhengHei", "font_size": 10, "num_format": "yyyy-mm-dd", "align": "center"}),
+        "timestamp": workbook.add_format({"font_name": "Microsoft JhengHei", "font_size": 10, "num_format": "yyyy-mm-dd hh:mm:ss"}),
         "auto": workbook.add_format({"font_name": "Microsoft JhengHei", "bg_color": "#E6F4EA", "font_color": "#1F6D3A", "num_format": "0.000", "align": "center"}),
         "review": workbook.add_format({"font_name": "Microsoft JhengHei", "bg_color": "#FFF2CC", "font_color": "#8A5A00", "num_format": "0.000", "align": "center"}),
         "missing": workbook.add_format({"font_name": "Microsoft JhengHei", "bg_color": "#FCE8E6", "font_color": "#A61B1B", "align": "center"}),
@@ -1602,6 +1862,8 @@ def write_monthly_workbook(
         "stat_label": workbook.add_format({"font_name": "Microsoft JhengHei", "bold": True, "font_color": "#FFFFFF", "bg_color": "#17324D", "align": "center"}),
         "stat": workbook.add_format({"font_name": "Microsoft JhengHei", "bold": True, "num_format": "0.000", "bg_color": "#EDF4F7", "align": "center"}),
         "link": workbook.add_format({"font_name": "Microsoft JhengHei", "font_color": "#0563C1", "underline": True, "align": "center"}),
+        "ledger_input": workbook.add_format({"font_name": "Consolas", "font_size": 9, "bg_color": "#FFF9E6", "font_color": "#7A4B00", "locked": False}),
+        "ledger_note": workbook.add_format({"font_name": "Microsoft JhengHei", "font_size": 9, "bg_color": "#FFF9E6", "locked": False, "text_wrap": True}),
     }
 
     guide = workbook.add_worksheet("操作說明")
@@ -1655,6 +1917,200 @@ def write_monthly_workbook(
     guide.set_landscape()
     guide.fit_to_pages(1, 0)
 
+    candidate_sheet = workbook.add_worksheet("候選清單")
+    candidate_sheet.hide_gridlines(2)
+    candidate_sheet.freeze_panes(1, 0)
+    candidate_headers = [
+        "Scope",
+        "日期",
+        "方位",
+        "排名",
+        "Candidate ID",
+        "Distance (NM)",
+        "Bearing",
+        "Timestamp",
+        "MMSI",
+        "Channel",
+        "Fragment",
+        "Sheet",
+        "Source row",
+        "Msg type",
+    ]
+    candidate_sheet.write_row(0, 0, candidate_headers, formats["header"])
+    candidate_sheet.set_column("A:A", 14)
+    candidate_sheet.set_column("B:B", 12)
+    candidate_sheet.set_column("C:D", 11)
+    candidate_sheet.set_column("E:E", 27)
+    candidate_sheet.set_column("F:G", 13)
+    candidate_sheet.set_column("H:H", 21)
+    candidate_sheet.set_column("I:J", 13)
+    candidate_sheet.set_column("K:K", 38)
+    candidate_sheet.set_column("L:N", 13)
+    candidate_row = 1
+    for day_result in day_results:
+        for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B):
+            for direction_index in OPEN_SEA_INDEXES:
+                direction = DIRECTION_ORDER[direction_index]
+                direction_result = _scope_directions(day_result, scope).get(direction)
+                if direction_result is None:
+                    continue
+                for list_position, candidate in enumerate(direction_result.candidates, start=1):
+                    candidate_sheet.write(candidate_row, 0, scope, formats["body"])
+                    candidate_sheet.write_datetime(
+                        candidate_row,
+                        1,
+                        datetime.combine(day_result.day, datetime.min.time()),
+                        formats["date"],
+                    )
+                    candidate_sheet.write(candidate_row, 2, direction, formats["body"])
+                    candidate_sheet.write_number(
+                        candidate_row, 3, candidate.rank or list_position, formats["integer"]
+                    )
+                    candidate_sheet.write(candidate_row, 4, candidate.candidate_id, formats["body"])
+                    candidate_sheet.write_number(candidate_row, 5, candidate.distance, formats["number"])
+                    candidate_sheet.write_number(candidate_row, 6, candidate.bearing, formats["number"])
+                    if candidate.timestamp is None:
+                        candidate_sheet.write_blank(candidate_row, 7, None, formats["body"])
+                    else:
+                        candidate_sheet.write_datetime(
+                            candidate_row,
+                            7,
+                            candidate.timestamp,
+                            formats["timestamp"],
+                        )
+                    if candidate.mmsi is None:
+                        candidate_sheet.write_blank(candidate_row, 8, None, formats["body"])
+                    else:
+                        candidate_sheet.write_number(candidate_row, 8, candidate.mmsi, formats["integer"])
+                    candidate_sheet.write(candidate_row, 9, candidate.channel or "", formats["body"])
+                    candidate_sheet.write(candidate_row, 10, candidate.fragment, formats["body"])
+                    candidate_sheet.write(candidate_row, 11, candidate.sheet, formats["body"])
+                    candidate_sheet.write_number(candidate_row, 12, candidate.source_row, formats["integer"])
+                    if candidate.msg_type is None:
+                        candidate_sheet.write_blank(candidate_row, 13, None, formats["body"])
+                    else:
+                        candidate_sheet.write_number(candidate_row, 13, candidate.msg_type, formats["integer"])
+                    candidate_row += 1
+    if candidate_row > 1:
+        candidate_sheet.autofilter(0, 0, candidate_row - 1, len(candidate_headers) - 1)
+
+    ledger = workbook.add_worksheet("決策台帳")
+    ledger.hide_gridlines(2)
+    ledger.freeze_panes(1, 0)
+    ledger_headers = [
+        "Scope",
+        "日期",
+        "方位",
+        "自動 Candidate ID",
+        "自動值",
+        "決策 Candidate ID",
+        "Forced numeric override",
+        "Final value",
+        "狀態",
+        "備註",
+    ]
+    ledger.write_row(0, 0, ledger_headers, formats["header"])
+    ledger.set_column("A:A", 14)
+    ledger.set_column("B:B", 12)
+    ledger.set_column("C:C", 11)
+    ledger.set_column("D:D", 27)
+    ledger.set_column("E:E", 13)
+    ledger.set_column("F:F", 27)
+    ledger.set_column("G:H", 18)
+    ledger.set_column("I:I", 13)
+    ledger.set_column("J:J", 42)
+    decision_row_lookup: dict[tuple[str, date, str], int] = {}
+    candidate_last_excel_row = max(candidate_row, 2)
+    lookup_formula = (
+        f"IFERROR(INDEX('候選清單'!$F$2:$F${candidate_last_excel_row},"
+        f"MATCH(F{{row}},'候選清單'!$E$2:$E${candidate_last_excel_row},0)),\"#INVALID_CANDIDATE\")"
+    )
+    for ledger_row, decision in enumerate(decision_snapshot.decisions, start=1):
+        key = (decision.scope, decision.day, decision.direction)
+        decision_row_lookup[key] = ledger_row + 1
+        automatic = _scope_directions(
+            next(item for item in day_results if item.day == decision.day), decision.scope
+        )[decision.direction]
+        ledger.write(ledger_row, 0, decision.scope, formats["body"])
+        ledger.write_datetime(
+            ledger_row,
+            1,
+            datetime.combine(decision.day, datetime.min.time()),
+            formats["date"],
+        )
+        ledger.write(ledger_row, 2, decision.direction, formats["body"])
+        ledger.write(ledger_row, 3, automatic.selected_candidate_id or "", formats["body"])
+        if automatic.selected is None:
+            ledger.write_blank(ledger_row, 4, None, formats["missing"])
+        else:
+            ledger.write_number(ledger_row, 4, automatic.selected, formats["number"])
+        ledger.write(ledger_row, 5, decision.candidate_id or "", formats["ledger_input"])
+        if decision.forced_numeric is None:
+            ledger.write_blank(
+                ledger_row,
+                6,
+                None,
+                formats["ledger_input"] if decision.scope == LOGICAL_DAY else formats["excluded"],
+            )
+        else:
+            ledger.write_number(ledger_row, 6, decision.forced_numeric, formats["ledger_input"])
+        excel_row = ledger_row + 1
+        candidate_lookup = lookup_formula.format(row=excel_row)
+        if decision.scope == LOGICAL_DAY:
+            formula = (
+                f'=IF(ISNUMBER(G{excel_row}),G{excel_row},IF(F{excel_row}="","",{candidate_lookup}))'
+            )
+        else:
+            formula = (
+                f'=IF(G{excel_row}<>"","#INVALID_PERIOD_NUMERIC",'
+                f'IF(F{excel_row}="","",{candidate_lookup}))'
+            )
+        final_value = decision_values[key]
+        ledger.write_formula(
+            ledger_row,
+            7,
+            formula,
+            formats["final"],
+            final_value if final_value is not None else "",
+        )
+        ledger.write(ledger_row, 8, automatic.status, formats["body"])
+        ledger.write(ledger_row, 9, decision.note, formats["ledger_note"])
+    if decision_snapshot.decisions:
+        ledger.autofilter(0, 0, len(decision_snapshot.decisions), len(ledger_headers) - 1)
+    ledger.protect("", {"select_unlocked_cells": True, "autofilter": True})
+
+    system_sheet = workbook.add_worksheet("系統資料")
+    system_rows = [
+        ("Schema", REVIEW_WORKBOOK_SCHEMA),
+        ("Port", config.port),
+        ("Period", f"{config.year}-{config.month:02d}"),
+        ("Source manifest SHA-256", decision_snapshot.source_manifest_hash),
+        ("Modern message types", ",".join(map(str, config.message_types))),
+        ("Historical delivery message types", ",".join(map(str, HISTORICAL_MESSAGE_TYPES))),
+        ("Decision count", len(decision_snapshot.decisions)),
+    ]
+    for system_row, (label, value) in enumerate(system_rows):
+        system_sheet.write(system_row, 0, label)
+        system_sheet.write(system_row, 1, value)
+    manifest_row = len(system_rows) + 1
+    system_sheet.write_row(
+        manifest_row,
+        0,
+        ["Date", "Spool SHA-256", "Fragment SHA-256", "Fragment", "Sheet", "Rows", "Aliases"],
+    )
+    manifest_row += 1
+    for day_result in day_results:
+        for info in day_result.fragment_info:
+            system_sheet.write(manifest_row, 0, day_result.day.isoformat())
+            system_sheet.write(manifest_row, 1, day_result.spool_sha256)
+            system_sheet.write(manifest_row, 2, info.sha256)
+            system_sheet.write(manifest_row, 3, info.path.name)
+            system_sheet.write(manifest_row, 4, info.sheet)
+            system_sheet.write_number(manifest_row, 5, info.rows_scanned)
+            system_sheet.write(manifest_row, 6, "、".join(path.name for path in info.aliases))
+            manifest_row += 1
+    system_sheet.hide()
+
     daily_sheet_names: dict[date, str] = {}
     for day_index, day_result in enumerate(day_results, start=1):
         if cancel_event and cancel_event.is_set():
@@ -1685,8 +2141,8 @@ def write_monthly_workbook(
             else:
                 sheet.write(0, column, direction, formats["excluded"])
         sheet.write(1, 6, "自動值", formats["subheader"])
-        sheet.write(2, 6, "人工覆核值", formats["subheader"])
-        sheet.write(3, 6, "最終值", formats["subheader"])
+        sheet.write(2, 6, "覆核請至決策台帳", formats["subheader"])
+        sheet.write(3, 6, "Logical-day final", formats["subheader"])
         sheet.write(4, 6, "判定", formats["subheader"])
         sheet.write(5, 6, "來源檔", formats["subheader"])
 
@@ -1704,11 +2160,23 @@ def write_monthly_workbook(
                 sheet.write_blank(1, column, None, status_format)
             else:
                 sheet.write_number(1, column, selected, status_format)
-            sheet.write_blank(2, column, None, formats["input"])
-            sheet.data_validation(2, column, 2, column, {"validate": "decimal", "criteria": "between", "minimum": 0, "maximum": config.max_distance, "input_title": "人工覆核值", "input_message": "若不同意自動值，請輸入最終距離（NM）。"})
-            cell = f"{_excel_col(column)}"
-            final_formula = f'=IFERROR(IF(ISNUMBER({cell}3),{cell}3,IF(ISNUMBER({cell}2),{cell}2,"")),"")'
-            sheet.write_formula(3, column, final_formula, formats["final"], selected if selected is not None else "")
+            ledger_excel_row = decision_row_lookup[(LOGICAL_DAY, day_result.day, direction)]
+            sheet.write_url(
+                2,
+                column,
+                f"internal:'決策台帳'!F{ledger_excel_row}",
+                formats["link"],
+                "前往台帳",
+            )
+            final_value = decision_values[(LOGICAL_DAY, day_result.day, direction)]
+            final_formula = f"='決策台帳'!H{ledger_excel_row}"
+            sheet.write_formula(
+                3,
+                column,
+                final_formula,
+                formats["final"],
+                final_value if final_value is not None else "",
+            )
             sheet.write(4, column, direction_result.status, status_format)
             sheet.write(5, column, _source_fragment_label(day_result), formats["note"])
 
@@ -1762,7 +2230,8 @@ def write_monthly_workbook(
             direction_result = day_result.directions[direction]
             source_column = _excel_col(7 + direction_index)
             formula = f'=IFERROR(\'{source_sheet}\'!{source_column}4,"")'
-            cached = direction_result.selected if direction_result.selected is not None else ""
+            final_value = decision_values[(LOGICAL_DAY, day_result.day, direction)]
+            cached = final_value if final_value is not None else ""
             status_format = formats["auto"] if direction_result.status == "自動採用" else formats["review"] if direction_result.status == "待複核" else formats["missing"]
             total_sheet.write_formula(row_index, column, formula, status_format, cached)
 
@@ -1770,7 +2239,9 @@ def write_monthly_workbook(
     stat_specs = [("MAX", "MAX"), ("MIN", "MIN"), ("平均", "AVERAGE"), ("標準差", "STDEV.S")]
     stat_values_by_direction: dict[str, tuple[float | None, float | None, float | None, float | None]] = {}
     for direction in DIRECTION_ORDER:
-        stat_values_by_direction[direction] = _stats(day.directions[direction].selected for day in day_results)
+        stat_values_by_direction[direction] = _stats(
+            decision_values.get((LOGICAL_DAY, day.day, direction)) for day in day_results
+        )
     for stat_offset, (label, function) in enumerate(stat_specs):
         row = stat_start_row + stat_offset
         total_sheet.write(row, 0, label, formats["stat_label"])
@@ -1803,7 +2274,10 @@ def write_monthly_workbook(
     radar = workbook.add_chart({"type": "radar", "subtype": "with_markers"})
     palette = ["#2F6B7C", "#D97706", "#7C3AED", "#15803D", "#B91C1C", "#0369A1", "#A21CAF"]
     for day_offset, day_result in enumerate(day_results):
-        if not any(day_result.directions[DIRECTION_ORDER[index]].selected is not None for index in OPEN_SEA_INDEXES):
+        if not any(
+            decision_values.get((LOGICAL_DAY, day_result.day, DIRECTION_ORDER[index])) is not None
+            for index in OPEN_SEA_INDEXES
+        ):
             continue
         excel_row = first_data_row_excel + day_offset
         radar.add_series(
@@ -1888,9 +2362,14 @@ def write_monthly_workbook(
             review_sheet.write(review_row, 4, direction_result.status, formats["review"] if direction_result.status == "待複核" else formats["missing"])
             review_sheet.write(review_row, 5, direction_result.reason, formats["body_wrap"])
             review_sheet.write(review_row, 6, ", ".join(f"{candidate.distance:.3f}" for candidate in direction_result.candidates[:10]), formats["body_wrap"])
-            source_sheet = daily_sheet_names[day_result.day]
-            source_column = _excel_col(7 + direction_index)
-            review_sheet.write_url(review_row, 7, f"internal:'{source_sheet}'!{source_column}3", formats["link"], f"{source_sheet}!{source_column}3")
+            ledger_excel_row = decision_row_lookup[(LOGICAL_DAY, day_result.day, direction)]
+            review_sheet.write_url(
+                review_row,
+                7,
+                f"internal:'決策台帳'!F{ledger_excel_row}",
+                formats["link"],
+                f"決策台帳!F{ledger_excel_row}",
+            )
             review_row += 1
     if review_row == 1:
         review_sheet.write(1, 0, "沒有待複核項目", formats["auto"])

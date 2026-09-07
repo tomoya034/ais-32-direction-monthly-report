@@ -19,13 +19,19 @@ from ais_monthly_app import (
     PERIOD_B,
     SourceFileError,
     SourceFragment,
+    _display_candidate_catalog,
     _normalized_spool_path,
+    build_default_decision_snapshot,
     build_processing_job,
     parse_source_filename,
     process_day_input,
     read_normalized_spool,
+    read_review_decisions,
+    resolve_decision_values,
     scan_source_files,
     select_cluster_from_sorted_rows,
+    source_manifest_hash,
+    write_monthly_workbook,
 )
 
 
@@ -309,6 +315,107 @@ class FragmentCatalogTests(unittest.TestCase):
             config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
             with self.assertRaisesRegex(SourceFileError, "正式五檔輸出需要"):
                 process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+
+
+class ReviewLedgerTests(unittest.TestCase):
+    def test_scoped_ledger_enforces_candidate_only_period_contract(self) -> None:
+        import shutil
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_any.xlsx"
+            FragmentCatalogTests._write_records(
+                source,
+                [
+                    (1, 0, "A", 1, 50.0),
+                    (1, 1, "A", 1, 49.0),
+                    (1, 2, "B", 1, 48.0),
+                    (13, 0, "A", 3, 70.0),
+                    (13, 1, "A", 3, 69.0),
+                    (13, 2, "B", 3, 68.0),
+                ],
+            )
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "ANY", source)
+            config = AppConfig(folder, folder / "analysis.xlsx", "KLNG", 2026, 6)
+            result = process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+            results = [result]
+            snapshot = build_default_decision_snapshot(config, results)
+            write_monthly_workbook(config, results, [], snapshot)
+
+            workbook = openpyxl.load_workbook(config.output_path, read_only=False, data_only=False)
+            try:
+                self.assertIn("決策台帳", workbook.sheetnames)
+                self.assertIn("候選清單", workbook.sheetnames)
+                self.assertEqual(workbook["系統資料"].sheet_state, "hidden")
+                ledger = workbook["決策台帳"]
+                self.assertEqual(ledger.max_row, 1 + 3 * 21)
+                self.assertEqual(ledger["A2"].value, "logical_day")
+                period_a_row = next(
+                    row
+                    for row in range(2, ledger.max_row + 1)
+                    if ledger.cell(row, 1).value == PERIOD_A
+                )
+                self.assertIsNone(ledger.cell(period_a_row, 7).value)
+                self.assertTrue(str(ledger.cell(period_a_row, 8).value).startswith("="))
+                candidate_headers = [cell.value for cell in workbook["候選清單"][1]]
+                self.assertIn("Timestamp", candidate_headers)
+                self.assertIn("MMSI", candidate_headers)
+                self.assertIn("Fragment", candidate_headers)
+            finally:
+                workbook.close()
+
+            candidate_catalog = {
+                key: set(candidates)
+                for key, candidates in _display_candidate_catalog(results).items()
+            }
+            loaded = read_review_decisions(
+                config.output_path,
+                expected_manifest_hash=source_manifest_hash(config, results),
+                candidate_catalog=candidate_catalog,
+            )
+            self.assertEqual(resolve_decision_values(loaded, results), resolve_decision_values(snapshot, results))
+
+            period_numeric = folder / "period_numeric.xlsx"
+            shutil.copyfile(config.output_path, period_numeric)
+            workbook = openpyxl.load_workbook(period_numeric)
+            ledger = workbook["決策台帳"]
+            period_a_row = next(
+                row for row in range(2, ledger.max_row + 1) if ledger.cell(row, 1).value == PERIOD_A
+            )
+            ledger.cell(period_a_row, 7).value = 12.3
+            workbook.save(period_numeric)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "Period A/B 不允許"):
+                read_review_decisions(period_numeric)
+
+            fake_candidate = folder / "fake_candidate.xlsx"
+            shutil.copyfile(config.output_path, fake_candidate)
+            workbook = openpyxl.load_workbook(fake_candidate)
+            workbook["決策台帳"].cell(period_a_row, 6).value = "not-a-real-candidate"
+            workbook.save(fake_candidate)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "candidate ID 不屬於"):
+                read_review_decisions(fake_candidate, candidate_catalog=candidate_catalog)
+
+            logical_override = folder / "logical_override.xlsx"
+            shutil.copyfile(config.output_path, logical_override)
+            workbook = openpyxl.load_workbook(logical_override)
+            workbook["決策台帳"]["G2"] = 123.456
+            workbook.save(logical_override)
+            workbook.close()
+            overridden = read_review_decisions(logical_override)
+            values = resolve_decision_values(overridden, results)
+            self.assertEqual(values[("logical_day", dt.date(2026, 6, 1), "北")], 123.456)
+
+            broken_formula = folder / "broken_formula.xlsx"
+            shutil.copyfile(config.output_path, broken_formula)
+            workbook = openpyxl.load_workbook(broken_formula)
+            workbook["決策台帳"]["H2"] = 1
+            workbook.save(broken_formula)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "Final value 公式已遭破壞"):
+                read_review_decisions(broken_formula)
 
 
 class ExternalJuneContractTests(unittest.TestCase):

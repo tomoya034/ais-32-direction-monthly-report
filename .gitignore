@@ -33,6 +33,7 @@ dist/
 .*_rows/
 .ais-*/
 *.building.*
+*.rollback
 AIS月報_錯誤報告_*.txt
 
 # Editors and Windows

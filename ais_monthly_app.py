@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ EXCEL_MAX_DATA_ROWS = 1_048_575
 NORMALIZED_SPOOL_MAGIC = b"AISNRM1\0"
 NORMALIZED_RECORD = struct.Struct("<ddQIIBq16s")
 NORMALIZED_COUNTS = struct.Struct("<32Q")
+DUPLICATE_AUDIT_RECORD_LIMIT = 250_000
 HISTORICAL_MESSAGE_TYPES = (1, 3, 4, 18, 19)
 PERIOD_A = "period_a"
 PERIOD_B = "period_b"
@@ -1175,22 +1177,37 @@ def _process_day_worker(arguments: tuple[DayInput, AppConfig]) -> tuple[date, Da
 
 
 def preflight_output_space(config: AppConfig, source_files: Iterable[Path]) -> tuple[int, int | None]:
-    targets = [config.output_path, derive_delivery_paths(config).root]
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
-
+    modern_directory = config.output_path.parent
+    delivery_directory = derive_delivery_paths(config).root
+    modern_directory.mkdir(parents=True, exist_ok=True)
+    delivery_directory.mkdir(parents=True, exist_ok=True)
     source_size = sum(path.stat().st_size for path in source_files)
-    required = max(1536 * 1024**2, int(source_size * 0.55))
-    try:
-        free = shutil.disk_usage(config.output_path.parent).free
-    except OSError:
-        free = None
-    if free is not None and free > 0 and free < required:
-        raise OSError(
-            f"輸出磁碟空間可能不足。估計至少需要 {required / 1024**3:.1f} GB，"
-            f"目前可用 {free / 1024**3:.1f} GB。請更換輸出位置或清出空間。"
-        )
-    return required, free
+    same_volume = (
+        modern_directory.resolve().anchor.casefold()
+        == delivery_directory.resolve().anchor.casefold()
+    )
+    if same_volume:
+        requirements = {
+            modern_directory: max(1536 * 1024**2, int(source_size * 0.55))
+        }
+    else:
+        requirements = {
+            modern_directory: max(256 * 1024**2, int(source_size * 0.08)),
+            delivery_directory: max(1280 * 1024**2, int(source_size * 0.50)),
+        }
+    available: list[int] = []
+    for directory, required_bytes in requirements.items():
+        try:
+            free_bytes = shutil.disk_usage(directory).free
+        except OSError:
+            continue
+        available.append(free_bytes)
+        if free_bytes > 0 and free_bytes < required_bytes:
+            raise OSError(
+                f"輸出磁碟空間可能不足：{directory}。估計至少需要 "
+                f"{required_bytes / 1024**3:.1f} GB，目前可用 {free_bytes / 1024**3:.1f} GB。"
+            )
+    return sum(requirements.values()), min(available) if available else None
 
 
 def process_day_input(
@@ -1371,6 +1388,85 @@ def process_day_input(
                 diagnostics.append(
                     f"occupied-second overlap：{first.path.name} / {second.path.name} "
                     f"共 {occupied_overlap:,} 秒；未做 timestamp dedupe"
+                )
+                overlap_seconds = {
+                    second_of_day
+                    for second_of_day, (left, right) in enumerate(
+                        zip(
+                            occupied_by_fragment[first_index],
+                            occupied_by_fragment[second_index],
+                        )
+                    )
+                    if left and right
+                }
+                left_records: list[NormalizedRecord] = []
+                right_records: list[NormalizedRecord] = []
+                audit_truncated = False
+                for bucket in all_rows:
+                    for record in bucket:
+                        if record.second_of_day not in overlap_seconds:
+                            continue
+                        fragment_index = record.source_key >> 32
+                        if fragment_index == first_index:
+                            left_records.append(record)
+                        elif fragment_index == second_index:
+                            right_records.append(record)
+                        if len(left_records) + len(right_records) > DUPLICATE_AUDIT_RECORD_LIMIT:
+                            audit_truncated = True
+                            break
+                    if audit_truncated:
+                        break
+                if audit_truncated:
+                    diagnostics.append(
+                        "normal same-second / possible duplicate event / exact normalized core "
+                        f"record audit 超過 {DUPLICATE_AUDIT_RECORD_LIMIT:,} 筆上限，未完整計數；"
+                        "非 byte-identical fragments 未自動去重"
+                    )
+                    continue
+                exact_key = lambda record: (
+                    record.second_of_day,
+                    record.msg_type,
+                    record.mmsi,
+                    record.channel,
+                    record.bearing,
+                    record.distance,
+                )
+                event_key = lambda record: (
+                    record.second_of_day,
+                    record.msg_type,
+                    record.mmsi,
+                )
+                left_exact = Counter(exact_key(record) for record in left_records)
+                right_exact = Counter(exact_key(record) for record in right_records)
+                exact_duplicates = sum((left_exact & right_exact).values())
+                left_events = Counter(
+                    event_key(record) for record in left_records if record.mmsi is not None
+                )
+                right_events = Counter(
+                    event_key(record) for record in right_records if record.mmsi is not None
+                )
+                event_matches = sum((left_events & right_events).values())
+                possible_duplicates = max(event_matches - exact_duplicates, 0)
+                left_seconds = {record.second_of_day for record in left_records}
+                right_seconds = {record.second_of_day for record in right_records}
+                event_identities_by_second: dict[int, set[tuple[int, int | None]]] = {}
+                for record in left_records:
+                    event_identities_by_second.setdefault(record.second_of_day, set()).add(
+                        (record.msg_type, record.mmsi)
+                    )
+                for record in right_records:
+                    event_identities_by_second.setdefault(record.second_of_day, set()).add(
+                        (record.msg_type, record.mmsi)
+                    )
+                normal_same_second = sum(
+                    len(event_identities_by_second[second_of_day]) > 1
+                    for second_of_day in left_seconds.intersection(right_seconds)
+                )
+                diagnostics.append(
+                    f"normal same-second different AIS messages：{normal_same_second:,} 秒；"
+                    f"possible duplicate events：{possible_duplicates:,} 筆；"
+                    f"exact normalized core records：{exact_duplicates:,} 筆；"
+                    "非 byte-identical fragments 未自動去重"
                 )
 
     result.fragment_info = tuple(fragment_info)
@@ -1882,6 +1978,14 @@ def read_review_decisions(
                     note="" if note_value is None else str(note_value),
                 )
             )
+        try:
+            expected_decision_count = int(metadata.get("Decision count", -1))
+        except (TypeError, ValueError) as error:
+            raise ValueError("覆核 workbook 的 Decision count metadata 無效。") from error
+        if expected_decision_count != len(decisions):
+            raise ValueError(
+                f"決策台帳列數已變更：預期 {expected_decision_count}，實際 {len(decisions)}。"
+            )
         return DecisionSnapshot(
             port=port,
             year=year,
@@ -2008,12 +2112,13 @@ def write_monthly_workbook(
         ("港別", config.port),
         ("製作月份", f"{config.year} 年 {config.month} 月"),
         ("來源資料夾", str(config.input_dir)),
-        ("輸出檔", str(config.output_path)),
-        ("訊息類型", ", ".join(map(str, config.message_types))),
+        ("Modern analysis", str(config.output_path)),
+        ("Modern research 訊息類型", ", ".join(map(str, config.message_types))),
+        ("Historical delivery 訊息類型", ", ".join(map(str, HISTORICAL_MESSAGE_TYPES))),
         ("經度描述", "LONGITUDE_DESC = East"),
         ("距離上限", f"{config.max_distance:g} NM；超過者不納入自動值並保留計數"),
         ("群聚規則", f"由高至低尋找至少 {config.cluster_size} 筆、彼此位於最高值減 {config.tolerance:.0%} 範圍內的第一群"),
-        ("候選保留", f"每個方向保留前 {config.top_candidates} 筆合格資料，供追查與人工覆核"),
+        ("候選顯示", f"每個 scope／方向顯示前 {config.top_candidates} 筆；完整 selector 搜尋不受此數量影響"),
         ("處理方位", "北至東南東、西南西至北微西，共 21 方位；朝向臺灣的中間 11 方位不處理"),
         ("原始資料", "所有來源檔只讀取、不修改；清理與覆核結果另存於本月報"),
     ]
@@ -2025,11 +2130,11 @@ def write_monthly_workbook(
     next_row = 3 + len(settings) + 2
     guide.write(next_row, 0, "使用方式", formats["section"])
     instructions = [
-        "先看「總表」與兩張圖，這些值會引用各日工作表的「最終值」。",
-        "再看「待複核」；黃色項目代表群聚不足，或西南西／西微南／西超過 10 NM。",
-        "如要修正，前往該日工作表，在方向欄的「人工覆核值」輸入距離；「最終值」與總表會自動改用人工值。",
-        "每日工作表 A:F 保存自動判斷所用的候選資料與原始列號，可回查來源檔。",
-        "自動規則是把影片中的人工判斷具體化；它不能取代研究上的最終判斷，因此所有例外均明確標記。",
+        "「總表」與每日工作表顯示整個 logical day 合併所有 fragments 後的 Modern research 值。",
+        "「候選清單」與「決策台帳」明確分成 logical_day、period_a、period_b 三個 scope。",
+        "Period A/B 只可填入同 day／period／direction 的 Candidate ID 或留白；只有 logical_day 可使用 forced numeric override。",
+        "完成覆核後先儲存本 workbook，再由程式選擇「讀取已覆核分析並重生五份成果」。五份成果不得各自人工修改。",
+        "五份 Historical delivery 固定使用訊息類型 1,3,4,18,19；整合值嚴格等於 MAX(Period A final, Period B final)。",
     ]
     for offset, instruction in enumerate(instructions, start=1):
         guide.write(next_row + offset, 0, f"{offset}.", formats["subheader"])
@@ -3119,9 +3224,22 @@ def write_delivery_workbooks(
 ) -> DeliveryPaths:
     paths = derive_delivery_paths(config, root)
     paths.root.mkdir(parents=True, exist_ok=True)
+    final_files = paths.all_files()
+    rollback_paths = {
+        path: path.with_name(f".{path.name}.rollback") for path in final_files
+    }
+    for final_path, rollback_path in rollback_paths.items():
+        if not rollback_path.exists():
+            continue
+        if final_path.exists():
+            raise FileExistsError(
+                f"偵測到未完成的五檔替換且新舊檔並存：{rollback_path.name}；"
+                "請先保留現況並人工確認。"
+            )
+        os.replace(rollback_path, final_path)
     validate_decision_snapshot_contract(snapshot, config, day_results)
     if not config.overwrite:
-        existing = [path for path in paths.all_files() if path.exists()]
+        existing = [path for path in final_files if path.exists()]
         if existing:
             raise FileExistsError("正式交付檔已存在：" + "、".join(path.name for path in existing))
     expected_manifest = source_manifest_hash(config, day_results)
@@ -3147,12 +3265,14 @@ def write_delivery_workbooks(
                 raise AssertionError("integrated != MAX(period A, period B)")
 
     temporary = {
-        path: path.with_name(path.stem + ".building.xlsx") for path in paths.all_files()
+        path: path.with_name(path.stem + ".building.xlsx") for path in final_files
     }
     for temp_path in temporary.values():
         temp_path.unlink(missing_ok=True)
+    backed_up: dict[Path, Path] = {}
+    promoted: list[Path] = []
     try:
-        emit(callback, kind="delivery_write_start", files=[path.name for path in paths.all_files()])
+        emit(callback, kind="delivery_write_start", files=[path.name for path in final_files])
         _write_period_full_workbook(
             temporary[paths.period_b_full], config, day_results, PERIOD_B, period_b, cancel_event
         )
@@ -3177,16 +3297,40 @@ def write_delivery_workbooks(
             integrated_inputs=(period_a, period_b),
         )
         emit(callback, kind="delivery_file_done", position=5, total=5, file=paths.integrated_summary.name)
-        for final_path in paths.all_files():
+        for final_path in final_files:
+            if final_path.exists():
+                rollback_path = rollback_paths[final_path]
+                os.replace(final_path, rollback_path)
+                backed_up[final_path] = rollback_path
+        for final_path in final_files:
             os.replace(temporary[final_path], final_path)
-    except Exception:
+            promoted.append(final_path)
+    except Exception as error:
         for temp_path in temporary.values():
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+        rollback_errors: list[str] = []
+        for final_path in promoted:
+            try:
+                final_path.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                rollback_errors.append(f"移除 {final_path.name}: {rollback_error}")
+        for final_path, rollback_path in backed_up.items():
+            try:
+                if rollback_path.exists():
+                    os.replace(rollback_path, final_path)
+            except OSError as rollback_error:
+                rollback_errors.append(f"還原 {final_path.name}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(
+                "五檔替換失敗且自動回復不完整：" + "；".join(rollback_errors)
+            ) from error
         raise
-    emit(callback, kind="delivery_write_done", files=[str(path) for path in paths.all_files()])
+    for rollback_path in backed_up.values():
+        rollback_path.unlink(missing_ok=True)
+    emit(callback, kind="delivery_write_done", files=[str(path) for path in final_files])
     return paths
 
 
@@ -3279,6 +3423,12 @@ def finalize_review_workbook(
         delivery_dir=delivery_dir,
         overwrite=overwrite,
     )
+    job = build_processing_job(config)
+    required, free = preflight_output_space(
+        config,
+        (fragment.path for day_input in job.days for fragment in day_input.fragments),
+    )
+    emit(callback, kind="preflight", required_bytes=required, free_bytes=free)
     day_results = load_finalization_results(config)
     manifest_hash = source_manifest_hash(config, day_results)
     snapshot = read_review_decisions(

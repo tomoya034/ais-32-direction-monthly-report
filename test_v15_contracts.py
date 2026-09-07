@@ -6,6 +6,7 @@ import math
 import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import openpyxl
 
@@ -23,6 +24,7 @@ from ais_monthly_app import (
     _normalized_spool_path,
     build_default_decision_snapshot,
     build_processing_job,
+    derive_delivery_paths,
     finalize_review_workbook,
     parse_source_filename,
     process_day_input,
@@ -207,6 +209,32 @@ class FragmentCatalogTests(unittest.TestCase):
                 (first.selected, first.selected_rank, first.cluster_count),
             )
 
+    def test_max_days_never_cuts_a_logical_day_fragment_set(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first = folder / "D&TMOK KLNG_20260601_11.xlsx"
+            second = folder / "D&TMOK KLNG_20260601_23.xlsx"
+            later = folder / "D&TMOK KLNG_20260602_11.xlsx"
+            self._write_fragment(first, [100.0, 99.0])
+            self._write_fragment(second, [98.0])
+            self._write_fragment(later, [70.0, 69.0, 68.0])
+            config = AppConfig(
+                folder,
+                folder / "analysis.xlsx",
+                "KLNG",
+                2026,
+                6,
+                top_candidates=3,
+                max_days=1,
+            )
+            results, _warnings = process_month(config)
+            self.assertEqual(len(results[0].source_fragments), 2)
+            self.assertEqual(results[0].directions["北"].selected, 100.0)
+            self.assertFalse(results[1].source_fragments)
+            self.assertIn("logical day", results[1].note)
+
     def test_spool_is_profile_superset_includes_over_cap_and_preserves_provenance(self) -> None:
         import tempfile
 
@@ -303,6 +331,58 @@ class FragmentCatalogTests(unittest.TestCase):
             self.assertEqual(result.fragment_info[0].aliases, (second,))
             self.assertTrue(any("byte-identical" in item for item in result.diagnostics))
 
+    def test_time_range_overlap_without_occupied_second_short_circuits_duplicate_scan(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first = folder / "D&TMOK KLNG_20260601_part-a.xlsx"
+            second = folder / "D&TMOK KLNG_20260601_part-b.xlsx"
+            self._write_records(first, [(1, 0, "A", 1, 50.0), (1, 2, "A", 1, 48.0)])
+            self._write_records(second, [(1, 1, "B", 3, 49.0)])
+            catalog, _warnings = scan_source_files(folder)
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+            result = process_day_input(catalog["KLNG"][dt.date(2026, 6, 1)], config)
+            joined = "\n".join(result.diagnostics)
+            self.assertIn("time-range overlap", joined)
+            self.assertNotIn("occupied-second overlap", joined)
+            self.assertNotIn("possible duplicate events", joined)
+            self.assertEqual(result.rows_normalized, 3)
+
+    def test_occupied_overlap_reports_normal_possible_and_exact_without_dedupe(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first = folder / "D&TMOK KLNG_20260601_alpha.xlsx"
+            second = folder / "D&TMOK KLNG_20260601_beta.xlsx"
+            self._write_records(
+                first,
+                [
+                    (1, 0, "A", 1, 50.0),
+                    (1, 1, "A", 3, 40.0),
+                    (1, 2, "A", 1, 30.0),
+                ],
+            )
+            self._write_records(
+                second,
+                [
+                    (1, 0, "B", 1, 49.0),
+                    (1, 1, "A", 3, 40.0),
+                    (1, 2, "A", 3, 29.0),
+                ],
+            )
+            catalog, _warnings = scan_source_files(folder)
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+            result = process_day_input(catalog["KLNG"][dt.date(2026, 6, 1)], config)
+            joined = "\n".join(result.diagnostics)
+            self.assertIn("occupied-second overlap", joined)
+            self.assertIn("normal same-second different AIS messages：1 秒", joined)
+            self.assertIn("possible duplicate events：1 筆", joined)
+            self.assertIn("exact normalized core records：1 筆", joined)
+            self.assertIn("未自動去重", joined)
+            self.assertEqual(result.rows_normalized, 6)
+
     def test_official_day_processing_rejects_missing_time_schema(self) -> None:
         import tempfile
 
@@ -317,6 +397,38 @@ class FragmentCatalogTests(unittest.TestCase):
             fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "BAD", source)
             config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
             with self.assertRaisesRegex(SourceFileError, "正式五檔輸出需要"):
+                process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+
+    def test_official_day_processing_rejects_row_from_another_day(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_wrong-day.xlsx"
+            workbook = openpyxl.Workbook(write_only=True)
+            sheet = workbook.create_sheet("AIS")
+            sheet.append([
+                "Year", "Month", "Day", "Hour", "Minute", "Second", "channel",
+                "msg_type", "mmsi", "LONGITUDE_DESC", "bearing",
+                "distance in nautical miles",
+            ])
+            sheet.append([2026, 6, 2, 1, 0, 0, "A", 1, 500000001, "East", 0.0, 50.0])
+            workbook.save(source)
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "WRONG-DAY", source)
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+            with self.assertRaisesRegex(SourceFileError, "不符合檔名 logical day"):
+                process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+
+    def test_official_day_processing_rejects_corrupt_xlsx(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_corrupt.xlsx"
+            source.write_bytes(b"not an xlsx")
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "CORRUPT", source)
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+            with self.assertRaisesRegex(SourceFileError, "無法開啟來源檔"):
                 process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
 
 
@@ -471,6 +583,28 @@ class ReviewLedgerTests(unittest.TestCase):
             self.assertEqual(cell(paths.period_b_summary, "總表", "B2"), 70.0)
             self.assertEqual(cell(paths.integrated_summary, "總表", "B2"), 70.0)
 
+            for full_path, summary_path in (
+                (paths.period_a_full, paths.period_a_summary),
+                (paths.period_b_full, paths.period_b_summary),
+            ):
+                full = openpyxl.load_workbook(full_path, read_only=True, data_only=True)
+                small = openpyxl.load_workbook(summary_path, read_only=True, data_only=True)
+                try:
+                    full_row = tuple(
+                        full["總表"].iter_rows(
+                            min_row=2, max_row=2, min_col=2, max_col=33, values_only=True
+                        )
+                    )[0]
+                    small_row = tuple(
+                        small["總表"].iter_rows(
+                            min_row=2, max_row=2, min_col=2, max_col=33, values_only=True
+                        )
+                    )[0]
+                    self.assertEqual(full_row, small_row)
+                finally:
+                    full.close()
+                    small.close()
+
             workbook = openpyxl.load_workbook(paths.period_a_full, read_only=True, data_only=True)
             try:
                 retained = [
@@ -489,6 +623,18 @@ class ReviewLedgerTests(unittest.TestCase):
                 self.assertEqual(len(formulas["總表"]._charts), 2)
             finally:
                 formulas.close()
+            for path in paths.all_files():
+                formulas = openpyxl.load_workbook(path, read_only=False, data_only=False)
+                try:
+                    summary = formulas["總表"]
+                    self.assertEqual(len(summary._charts), 2)
+                    self.assertIn("MAX(B2:B2)", summary["B4"].value)
+                    for row in summary.iter_rows():
+                        for item in row:
+                            if isinstance(item.value, str) and item.value.startswith("="):
+                                self.assertNotIn("#REF!", item.value)
+                finally:
+                    formulas.close()
 
             decisions = list(snapshot.decisions)
             for index, decision in enumerate(decisions):
@@ -625,6 +771,19 @@ class ReviewLedgerTests(unittest.TestCase):
                     overwrite=True,
                 )
 
+            incomplete = folder / "incomplete_review.xlsx"
+            shutil.copyfile(analysis, incomplete)
+            workbook = openpyxl.load_workbook(incomplete)
+            workbook["決策台帳"].delete_rows(workbook["決策台帳"].max_row)
+            workbook.save(incomplete)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "列數已變更"):
+                finalize_review_workbook(
+                    incomplete,
+                    delivery_dir=folder / "incomplete_delivery",
+                    overwrite=True,
+                )
+
             stat = source.stat()
             os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
             with self.assertRaisesRegex(ValueError, "已變更"):
@@ -633,6 +792,96 @@ class ReviewLedgerTests(unittest.TestCase):
                     delivery_dir=folder / "changed_source",
                     overwrite=True,
                 )
+
+    def test_delivery_row_limit_errors_before_any_final_file_is_published(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_any.xlsx"
+            FragmentCatalogTests._write_records(
+                source,
+                [
+                    (13, 0, "A", 1, 70.0),
+                    (13, 1, "A", 1, 69.0),
+                    (13, 2, "B", 1, 68.0),
+                ],
+            )
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "ANY", source)
+            config = AppConfig(
+                folder,
+                folder / "analysis.xlsx",
+                "KLNG",
+                2026,
+                6,
+                delivery_dir=folder / "delivery",
+                overwrite=True,
+            )
+            result = process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+            snapshot = build_default_decision_snapshot(config, [result])
+            expected = derive_delivery_paths(config)
+            with mock.patch("ais_monthly_app.EXCEL_MAX_DATA_ROWS", 2):
+                with self.assertRaisesRegex(SourceFileError, "超過 Excel 上限"):
+                    write_delivery_workbooks(config, [result], snapshot)
+            self.assertFalse(any(path.exists() for path in expected.all_files()))
+            self.assertFalse(any(expected.root.glob("*.building.xlsx")))
+
+    def test_five_file_promotion_failure_restores_previous_snapshot(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_any.xlsx"
+            FragmentCatalogTests._write_records(
+                source,
+                [
+                    (1, 0, "A", 1, 50.0),
+                    (1, 1, "A", 1, 49.0),
+                    (1, 2, "B", 1, 48.0),
+                    (13, 0, "A", 3, 70.0),
+                    (13, 1, "A", 3, 69.0),
+                    (13, 2, "B", 3, 68.0),
+                ],
+            )
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "ANY", source)
+            config = AppConfig(
+                folder,
+                folder / "analysis.xlsx",
+                "KLNG",
+                2026,
+                6,
+                delivery_dir=folder / "delivery",
+                overwrite=True,
+            )
+            result = process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
+            snapshot = build_default_decision_snapshot(config, [result])
+            paths = derive_delivery_paths(config)
+            paths.root.mkdir(parents=True, exist_ok=True)
+            old_contents = {}
+            for index, path in enumerate(paths.all_files()):
+                content = f"old-snapshot-{index}".encode("ascii")
+                path.write_bytes(content)
+                old_contents[path] = content
+
+            real_replace = os.replace
+            building_promotions = 0
+
+            def fail_second_building_promotion(source_path, destination_path):
+                nonlocal building_promotions
+                if str(source_path).endswith(".building.xlsx"):
+                    building_promotions += 1
+                    if building_promotions == 2:
+                        raise OSError("simulated promotion failure")
+                return real_replace(source_path, destination_path)
+
+            with mock.patch("ais_monthly_app.os.replace", side_effect=fail_second_building_promotion):
+                with self.assertRaisesRegex(OSError, "simulated promotion failure"):
+                    write_delivery_workbooks(config, [result], snapshot)
+
+            for path, content in old_contents.items():
+                self.assertEqual(path.read_bytes(), content)
+            self.assertFalse(any(paths.root.glob("*.building.xlsx")))
+            self.assertFalse(any(paths.root.glob("*.rollback")))
 
 
 class ExternalJuneContractTests(unittest.TestCase):
@@ -686,6 +935,93 @@ class ExternalJuneContractTests(unittest.TestCase):
                 else:
                     self.assertIsNone(period_a[(current, index)])
                     self.assertIsNone(period_b[(current, index)])
+
+    def test_representative_days_match_external_union_baseline(self) -> None:
+        import hashlib
+        import struct
+        import tempfile
+
+        input_path = os.environ.get("AIS_JUNE_INPUT_DIR")
+        baseline_path = os.environ.get("AIS_JUNE_BASELINE_JSON")
+        benchmark_path = os.environ.get("AIS_JUNE_BENCHMARK_JSON")
+        if not input_path or not baseline_path or not benchmark_path:
+            self.skipTest("external June representative-day regression is not configured")
+        input_dir = Path(input_path)
+        baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+        benchmark = json.loads(Path(benchmark_path).read_text(encoding="utf-8"))
+        baseline_by_day = {item["date"]: item for item in baseline["days"]}
+        benchmark_by_day = {
+            item["date"].replace("-", ""): item for item in benchmark["days"]
+        }
+        selected_days = tuple(
+            item.strip()
+            for item in os.environ.get(
+                "AIS_JUNE_REGRESSION_DAYS", "20260601,20260620"
+            ).split(",")
+            if item.strip()
+        )
+        output_parent = Path(
+            os.environ.get("AIS_JUNE_TEST_OUTPUT_ROOT", tempfile.gettempdir())
+        )
+        output_parent.mkdir(parents=True, exist_ok=True)
+
+        def selector_checksum(result) -> str:
+            digest = hashlib.sha256()
+            for index, direction in enumerate(DIRECTION_ORDER):
+                selected = result.directions[direction]
+                digest.update(struct.pack("<B", index))
+                digest.update(
+                    struct.pack(
+                        "<d",
+                        float("nan") if selected.selected is None else selected.selected,
+                    )
+                )
+                digest.update(
+                    struct.pack(
+                        "<q", -1 if selected.selected_rank is None else selected.selected_rank
+                    )
+                )
+                digest.update(struct.pack("<q", selected.cluster_count))
+            return digest.hexdigest()
+
+        with tempfile.TemporaryDirectory(dir=output_parent) as temporary:
+            config = AppConfig(
+                input_dir,
+                Path(temporary) / "analysis.xlsx",
+                "KLNG",
+                2026,
+                6,
+                workers=1,
+                overwrite=True,
+            )
+            job = build_processing_job(config)
+            job_by_day = {item.day.strftime("%Y%m%d"): item for item in job.days}
+            for day_key in selected_days:
+                with self.subTest(day=day_key):
+                    result = process_day_input(job_by_day[day_key], config)
+                    expected = baseline_by_day[day_key]
+                    measured = benchmark_by_day[day_key]["simple"]
+                    self.assertEqual(result.rows_scanned, benchmark_by_day[day_key]["raw_rows"])
+                    self.assertEqual(result.rows_accepted, measured["eligible_under_cap_rows"])
+                    self.assertEqual(len(result.source_fragments), 2)
+                    for direction in DIRECTION_ORDER:
+                        actual_direction = result.directions[direction]
+                        expected_direction = expected["current_full"][direction]
+                        self.assertEqual(
+                            (
+                                actual_direction.selected,
+                                actual_direction.selected_rank,
+                                actual_direction.cluster_count,
+                            ),
+                            (
+                                expected_direction["selected"],
+                                expected_direction["rank"],
+                                expected_direction["cluster_count"],
+                            ),
+                        )
+                    self.assertEqual(
+                        selector_checksum(result), measured["selector_sha256"]
+                    )
 
 
 if __name__ == "__main__":

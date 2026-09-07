@@ -56,7 +56,7 @@ OPEN_SEA_DIRECTIONS = tuple(DIRECTION_ORDER[index] for index in OPEN_SEA_INDEXES
 COASTAL_REVIEW_DIRECTIONS = {"西南西", "西微南", "西"}
 
 FILENAME_RE = re.compile(
-    r"^D&TMOK[ \t]+(?P<port>[A-Z][A-Z0-9]{1,15})_(?P<date>\d{8})(?:_[A-Z0-9_-]+)?\.xlsx$",
+    r"^D&TMOK[ \t]+(?P<port>[A-Z][A-Z0-9]{1,15})_(?P<date>\d{8})(?:_(?P<suffix>[A-Z0-9_-]+))?\.xlsx$",
     re.IGNORECASE,
 )
 PORT_RE = re.compile(r"^[A-Z][A-Z0-9]{1,15}$")
@@ -76,6 +76,22 @@ class SourceFileError(RuntimeError):
 class SourceFileIdentity:
     port: str
     day: date
+    suffix: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceFragment:
+    port: str
+    day: date
+    suffix: str | None
+    path: Path
+
+
+@dataclass(frozen=True)
+class DayInput:
+    port: str
+    day: date
+    fragments: tuple[SourceFragment, ...]
 
 
 @dataclass(frozen=True)
@@ -103,7 +119,7 @@ class DirectionResult:
 @dataclass
 class DayResult:
     day: date
-    source_file: Path | None
+    source_fragments: tuple[Path, ...]
     directions: dict[str, DirectionResult]
     rows_scanned: int = 0
     rows_accepted: int = 0
@@ -113,6 +129,11 @@ class DayResult:
     rows_legacy: int = 0
     elapsed_seconds: float = 0.0
     note: str = ""
+
+    @property
+    def source_file(self) -> Path | None:
+        """Deprecated single-file view; multi-fragment days deliberately return None."""
+        return self.source_fragments[0] if len(self.source_fragments) == 1 else None
 
 
 @dataclass
@@ -171,8 +192,17 @@ class ProcessingJob:
     port: str
     year: int
     month: int
-    files: tuple[tuple[date, Path], ...]
+    days: tuple[DayInput, ...]
     warnings: tuple[str, ...] = ()
+
+    @property
+    def files(self) -> tuple[tuple[date, Path], ...]:
+        """Flattened compatibility view. Internal processing must use ``days``."""
+        return tuple(
+            (day_input.day, fragment.path)
+            for day_input in self.days
+            for fragment in day_input.fragments
+        )
 
 
 def emit(callback: ProgressCallback | None, **payload: object) -> None:
@@ -207,7 +237,12 @@ def parse_source_filename(filename: str) -> SourceFileIdentity | None:
         parsed_day = datetime.strptime(match.group("date"), "%Y%m%d").date()
     except ValueError:
         return None
-    return SourceFileIdentity(port=match.group("port").upper(), day=parsed_day)
+    suffix = match.group("suffix")
+    return SourceFileIdentity(
+        port=match.group("port").upper(),
+        day=parsed_day,
+        suffix=suffix.upper() if suffix else None,
+    )
 
 
 def parse_source_date(filename: str) -> date | None:
@@ -215,30 +250,39 @@ def parse_source_date(filename: str) -> date | None:
     return parsed.day if parsed is not None else None
 
 
-def scan_source_files(folder: Path) -> tuple[dict[str, dict[date, Path]], dict[str, list[str]]]:
-    selected: dict[str, dict[date, Path]] = {}
+def scan_source_files(folder: Path) -> tuple[dict[str, dict[date, DayInput]], dict[str, list[str]]]:
+    grouped: dict[str, dict[date, list[SourceFragment]]] = {}
     warnings: dict[str, list[str]] = {}
     for path in sorted(folder.glob("*.xlsx"), key=lambda item: item.name.casefold()):
         identity = parse_source_filename(path.name)
         if identity is None:
             continue
-        port_files = selected.setdefault(identity.port, {})
-        port_warnings = warnings.setdefault(identity.port, [])
-        previous = port_files.get(identity.day)
-        if previous is None:
-            port_files[identity.day] = path
-            continue
-        # 同港別同一天多檔時採用最後修改者，同時留下明確警告。
-        winner = max((previous, path), key=lambda item: item.stat().st_mtime)
-        loser = path if winner == previous else previous
-        port_files[identity.day] = winner
-        port_warnings.append(
-            f"{identity.port} {identity.day:%Y-%m-%d} 有重複檔案，採用 {winner.name}，略過 {loser.name}"
+        grouped.setdefault(identity.port, {}).setdefault(identity.day, []).append(
+            SourceFragment(
+                port=identity.port,
+                day=identity.day,
+                suffix=identity.suffix,
+                path=path,
+            )
         )
-    return selected, warnings
+
+    catalog: dict[str, dict[date, DayInput]] = {}
+    for port, port_days in grouped.items():
+        output_days: dict[date, DayInput] = {}
+        port_warnings = warnings.setdefault(port, [])
+        for parsed_day, fragments in port_days.items():
+            ordered = tuple(sorted(fragments, key=lambda item: item.path.name.casefold()))
+            output_days[parsed_day] = DayInput(port=port, day=parsed_day, fragments=ordered)
+            if len(ordered) > 1:
+                port_warnings.append(
+                    f"{port} {parsed_day:%Y-%m-%d} 將合併 {len(ordered)} 個來源分片："
+                    + "、".join(fragment.path.name for fragment in ordered)
+                )
+        catalog[port] = output_days
+    return catalog, warnings
 
 
-def discover_source_files(folder: Path, port: str | None = None) -> tuple[dict[date, Path], list[str]]:
+def discover_source_files(folder: Path, port: str | None = None) -> tuple[dict[date, DayInput], list[str]]:
     catalog, warnings = scan_source_files(folder)
     if port is None:
         if len(catalog) > 1:
@@ -528,7 +572,7 @@ def empty_day_result(day: date, note: str = "當日來源檔缺漏") -> DayResul
         name: DirectionResult(direction=name, status="無資料", reason=note)
         for name in DIRECTION_ORDER
     }
-    return DayResult(day=day, source_file=None, directions=directions, note=note)
+    return DayResult(day=day, source_fragments=(), directions=directions, note=note)
 
 
 def _job_storage_token(config: AppConfig) -> str:
@@ -548,17 +592,22 @@ def _legacy_spool_path(config: AppConfig, parsed_day: date) -> Path:
     return _legacy_spool_directory(config) / f"{parsed_day:%Y%m%d}.bin"
 
 
-def _cache_signature(source_file: Path, parsed_day: date, config: AppConfig) -> dict[str, object]:
-    stats = source_file.stat()
+def _cache_signature(day_input: DayInput, config: AppConfig) -> dict[str, object]:
     return {
         "cache_version": CACHE_VERSION,
-        "source": str(source_file.resolve()),
-        "size": stats.st_size,
-        "modified_ns": stats.st_mtime_ns,
+        "sources": [
+            {
+                "path": str(fragment.path.resolve()),
+                "size": fragment.path.stat().st_size,
+                "modified_ns": fragment.path.stat().st_mtime_ns,
+                "suffix": fragment.suffix,
+            }
+            for fragment in day_input.fragments
+        ],
         "port": config.port,
         "year": config.year,
         "month": config.month,
-        "date": parsed_day.isoformat(),
+        "date": day_input.day.isoformat(),
         "max_distance": config.max_distance,
         "tolerance": config.tolerance,
         "cluster_size": config.cluster_size,
@@ -571,7 +620,7 @@ def _cache_signature(source_file: Path, parsed_day: date, config: AppConfig) -> 
 def _day_result_to_dict(day_result: DayResult) -> dict[str, object]:
     return {
         "day": day_result.day.isoformat(),
-        "source_file": str(day_result.source_file) if day_result.source_file else None,
+        "source_fragments": [str(path) for path in day_result.source_fragments],
         "rows_scanned": day_result.rows_scanned,
         "rows_accepted": day_result.rows_accepted,
         "rows_invalid": day_result.rows_invalid,
@@ -630,10 +679,15 @@ def _day_result_from_dict(payload: dict[str, object]) -> DayResult:
             over_cap_count=int(raw.get("over_cap_count", 0)),
             over_cap_max=raw.get("over_cap_max"),
         )
-    source_value = payload.get("source_file")
+    source_values = payload.get("source_fragments")
+    if source_values is None:
+        source_value = payload.get("source_file")
+        source_values = [source_value] if source_value else []
+    if not isinstance(source_values, list):
+        raise ValueError("快取 source_fragments 格式錯誤")
     return DayResult(
         day=date.fromisoformat(str(payload["day"])),
-        source_file=Path(str(source_value)) if source_value else None,
+        source_fragments=tuple(Path(str(value)) for value in source_values),
         directions=directions,
         rows_scanned=int(payload.get("rows_scanned", 0)),
         rows_accepted=int(payload.get("rows_accepted", 0)),
@@ -646,17 +700,17 @@ def _day_result_from_dict(payload: dict[str, object]) -> DayResult:
     )
 
 
-def load_cached_day(source_file: Path, parsed_day: date, config: AppConfig) -> DayResult | None:
-    cache_path = _cache_directory(config) / f"{parsed_day:%Y%m%d}.json"
+def load_cached_day(day_input: DayInput, config: AppConfig) -> DayResult | None:
+    cache_path = _cache_directory(config) / f"{day_input.day:%Y%m%d}.json"
     if not cache_path.is_file():
         return None
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        if payload.get("signature") != _cache_signature(source_file, parsed_day, config):
+        if payload.get("signature") != _cache_signature(day_input, config):
             return None
         result = _day_result_from_dict(payload["result"])
         if config.legacy_output_path is not None:
-            spool_path = _legacy_spool_path(config, parsed_day)
+            spool_path = _legacy_spool_path(config, day_input.day)
             if not spool_path.is_file() or sum(legacy_spool_counts(spool_path)) != result.rows_legacy:
                 return None
         return result
@@ -664,13 +718,13 @@ def load_cached_day(source_file: Path, parsed_day: date, config: AppConfig) -> D
         return None
 
 
-def save_cached_day(source_file: Path, parsed_day: date, config: AppConfig, day_result: DayResult) -> None:
+def save_cached_day(day_input: DayInput, config: AppConfig, day_result: DayResult) -> None:
     cache_dir = _cache_directory(config)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{parsed_day:%Y%m%d}.json"
+    cache_path = cache_dir / f"{day_input.day:%Y%m%d}.json"
     temp_path = cache_path.with_suffix(".tmp")
     payload = {
-        "signature": _cache_signature(source_file, parsed_day, config),
+        "signature": _cache_signature(day_input, config),
         "result": _day_result_to_dict(day_result),
     }
     temp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
@@ -742,9 +796,9 @@ def read_legacy_spool(path: Path) -> tuple[list[int], Iterable[tuple[int, float,
         raise
 
 
-def _process_file_worker(arguments: tuple[Path, date, AppConfig]) -> tuple[date, DayResult]:
-    source_file, parsed_day, config = arguments
-    return parsed_day, process_source_file(source_file, parsed_day, config)
+def _process_day_worker(arguments: tuple[DayInput, AppConfig]) -> tuple[date, DayResult]:
+    day_input, config = arguments
+    return day_input.day, process_day_input(day_input, config)
 
 
 def preflight_output_space(config: AppConfig, source_files: Iterable[Path]) -> tuple[int, int | None]:
@@ -771,13 +825,13 @@ def preflight_output_space(config: AppConfig, source_files: Iterable[Path]) -> t
     return required, free
 
 
-def process_source_file(
-    source_file: Path,
-    parsed_day: date,
+def process_day_input(
+    day_input: DayInput,
     config: AppConfig,
     callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> DayResult:
+    parsed_day = day_input.day
     started = time.perf_counter()
     heaps: list[list[tuple[float, int, float]]] = [[] for _ in DIRECTION_ORDER]
     legacy_rows: list[list[tuple[float, int, float]]] | None = (
@@ -787,82 +841,86 @@ def process_source_file(
     over_cap_maxes: list[float | None] = [None] * len(DIRECTION_ORDER)
     result = DayResult(
         day=parsed_day,
-        source_file=source_file,
+        source_fragments=tuple(fragment.path for fragment in day_input.fragments),
         directions={},
     )
 
-    try:
-        workbook = openpyxl.load_workbook(source_file, read_only=True, data_only=True)
-    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
-        raise SourceFileError(
-            f"無法開啟來源檔「{source_file.name}」。檔案可能損壞、尚未同步完成，或不是有效的 .xlsx。原始錯誤：{error}"
-        ) from error
-    try:
+    for fragment_index, fragment in enumerate(day_input.fragments):
+        source_file = fragment.path
         try:
-            worksheet, indexes = locate_data_worksheet(workbook)
-        except ValueError as error:
+            workbook = openpyxl.load_workbook(source_file, read_only=True, data_only=True)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
             raise SourceFileError(
-                f"來源檔「{source_file.name}」{error}。需要 msg_type、LONGITUDE_DESC、bearing、distance in nautical miles。"
+                f"無法開啟來源檔「{source_file.name}」。檔案可能損壞、尚未同步完成，或不是有效的 .xlsx。原始錯誤：{error}"
             ) from error
-        max_index = max(indexes.values())
-        estimated_rows = max((worksheet.max_row or 1) - 1, 1)
+        try:
+            try:
+                worksheet, indexes = locate_data_worksheet(workbook)
+            except ValueError as error:
+                raise SourceFileError(
+                    f"來源檔「{source_file.name}」{error}。需要 msg_type、LONGITUDE_DESC、bearing、distance in nautical miles。"
+                ) from error
+            max_index = max(indexes.values())
+            estimated_rows = max((worksheet.max_row or 1) - 1, 1)
 
-        for excel_row, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
-            result.rows_scanned += 1
-            if cancel_event and excel_row % 10000 == 0 and cancel_event.is_set():
-                raise CancelledError("使用者已取消")
-            if len(row) <= max_index:
-                result.rows_invalid += 1
-                continue
+            for excel_row, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
+                result.rows_scanned += 1
+                if cancel_event and excel_row % 10000 == 0 and cancel_event.is_set():
+                    raise CancelledError("使用者已取消")
+                if len(row) <= max_index:
+                    result.rows_invalid += 1
+                    continue
 
-            msg_type = _message_type(row[indexes["msg_type"]])
-            if msg_type not in config.message_types:
-                result.rows_wrong_message += 1
-                continue
-            longitude_desc = row[indexes["longitude_desc"]]
-            if str(longitude_desc).strip().casefold() != "east":
-                result.rows_not_east += 1
-                continue
+                msg_type = _message_type(row[indexes["msg_type"]])
+                if msg_type not in config.message_types:
+                    result.rows_wrong_message += 1
+                    continue
+                longitude_desc = row[indexes["longitude_desc"]]
+                if str(longitude_desc).strip().casefold() != "east":
+                    result.rows_not_east += 1
+                    continue
 
-            direction_info = degree_to_direction_index(row[indexes["bearing"]])
-            distance = _number(row[indexes["distance"]])
-            if direction_info is None or distance is None or distance < 0:
-                result.rows_invalid += 1
-                continue
+                direction_info = degree_to_direction_index(row[indexes["bearing"]])
+                distance = _number(row[indexes["distance"]])
+                if direction_info is None or distance is None or distance < 0:
+                    result.rows_invalid += 1
+                    continue
 
-            direction_index, normalized_bearing = direction_info
-            if legacy_rows is not None:
-                result.rows_legacy += 1
-                if result.rows_legacy > EXCEL_MAX_DATA_ROWS:
-                    raise SourceFileError(
-                        f"來源檔「{source_file.name}」符合舊格式的資料超過 Excel 單張工作表上限 {EXCEL_MAX_DATA_ROWS:,} 列。"
+                direction_index, normalized_bearing = direction_info
+                source_key = (fragment_index << 32) | excel_row
+                if legacy_rows is not None:
+                    result.rows_legacy += 1
+                    if result.rows_legacy > EXCEL_MAX_DATA_ROWS:
+                        raise SourceFileError(
+                            f"{parsed_day:%Y-%m-%d} 合併後符合舊格式的資料超過 Excel 單張工作表上限 "
+                            f"{EXCEL_MAX_DATA_ROWS:,} 列。"
+                        )
+                    legacy_rows[direction_index].append((distance, source_key, normalized_bearing))
+                if distance > config.max_distance:
+                    over_cap_counts[direction_index] += 1
+                    prior_max = over_cap_maxes[direction_index]
+                    if prior_max is None or distance > prior_max:
+                        over_cap_maxes[direction_index] = distance
+                    continue
+
+                result.rows_accepted += 1
+                heap = heaps[direction_index]
+                item = (distance, source_key, normalized_bearing)
+                if len(heap) < config.top_candidates:
+                    heapq.heappush(heap, item)
+                elif item[0] > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+
+                if excel_row % 100000 == 0:
+                    emit(
+                        callback,
+                        kind="rows",
+                        file=source_file.name,
+                        rows=result.rows_scanned,
+                        estimated_rows=estimated_rows,
                     )
-                legacy_rows[direction_index].append((distance, excel_row, normalized_bearing))
-            if distance > config.max_distance:
-                over_cap_counts[direction_index] += 1
-                prior_max = over_cap_maxes[direction_index]
-                if prior_max is None or distance > prior_max:
-                    over_cap_maxes[direction_index] = distance
-                continue
-
-            result.rows_accepted += 1
-            heap = heaps[direction_index]
-            item = (distance, excel_row, normalized_bearing)
-            if len(heap) < config.top_candidates:
-                heapq.heappush(heap, item)
-            elif item[0] > heap[0][0]:
-                heapq.heapreplace(heap, item)
-
-            if excel_row % 100000 == 0:
-                emit(
-                    callback,
-                    kind="rows",
-                    file=source_file.name,
-                    rows=result.rows_scanned,
-                    estimated_rows=estimated_rows,
-                )
-    finally:
-        workbook.close()
+        finally:
+            workbook.close()
 
     if legacy_rows is not None:
         for index, direction in enumerate(DIRECTION_ORDER):
@@ -897,16 +955,40 @@ def process_source_file(
     return result
 
 
+def process_source_file(
+    source_file: Path,
+    parsed_day: date,
+    config: AppConfig,
+    callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> DayResult:
+    """Compatibility wrapper for callers that intentionally process one fragment."""
+    identity = parse_source_filename(source_file.name)
+    fragment = SourceFragment(
+        port=identity.port if identity is not None else config.port,
+        day=parsed_day,
+        suffix=identity.suffix if identity is not None else None,
+        path=source_file,
+    )
+    return process_day_input(
+        DayInput(port=fragment.port, day=parsed_day, fragments=(fragment,)),
+        config,
+        callback=callback,
+        cancel_event=cancel_event,
+    )
+
+
 def build_processing_job(config: AppConfig) -> ProcessingJob:
     discovered, warnings = discover_source_files(config.input_dir, config.port)
-    files = tuple(
+    days = tuple(
         sorted(
-            (parsed, path)
-            for parsed, path in discovered.items()
+            (day_input for parsed, day_input in discovered.items()
             if parsed.year == config.year and parsed.month == config.month
+            ),
+            key=lambda item: item.day,
         )
     )
-    if not files:
+    if not days:
         raise ValueError(
             f"來源資料夾內找不到港別 {config.port}、{config.year} 年 {config.month} 月的 "
             "D&TMOK <PORT> 每日檔案。"
@@ -915,7 +997,7 @@ def build_processing_job(config: AppConfig) -> ProcessingJob:
         port=config.port,
         year=config.year,
         month=config.month,
-        files=files,
+        days=days,
         warnings=tuple(warnings),
     )
 
@@ -927,7 +1009,7 @@ def process_month(
 ) -> tuple[list[DayResult], list[str]]:
     config.validate()
     job = build_processing_job(config)
-    month_files = dict(job.files)
+    month_days = {day_input.day: day_input for day_input in job.days}
     warnings = list(job.warnings)
 
     emit(
@@ -936,40 +1018,44 @@ def process_month(
         port=job.port,
         year=job.year,
         month=job.month,
-        source_count=len(job.files),
+        source_count=len(job.days),
+        fragment_count=sum(len(day_input.fragments) for day_input in job.days),
     )
 
-    required, free = preflight_output_space(config, month_files.values())
+    required, free = preflight_output_space(
+        config,
+        (fragment.path for day_input in job.days for fragment in day_input.fragments),
+    )
     emit(callback, kind="preflight", required_bytes=required, free_bytes=free)
 
-    ordered_files = list(job.files)
+    ordered_days = list(job.days)
     if config.max_files is not None:
-        ordered_files = ordered_files[: config.max_files]
-        allowed_days = {parsed for parsed, _ in ordered_files}
+        ordered_days = ordered_days[: config.max_files]
+        allowed_days = {day_input.day for day_input in ordered_days}
     else:
-        allowed_days = set(month_files)
+        allowed_days = set(month_days)
 
     processed: dict[date, DayResult] = {}
-    total_files = len(ordered_files)
-    pending: list[tuple[date, Path]] = []
+    total_files = len(ordered_days)
+    pending: list[DayInput] = []
     completed_count = 0
-    for parsed, source_file in ordered_files:
-        cached = load_cached_day(source_file, parsed, config)
+    for day_input in ordered_days:
+        cached = load_cached_day(day_input, config)
         if cached is not None:
-            processed[parsed] = cached
+            processed[day_input.day] = cached
             completed_count += 1
             emit(
                 callback,
                 kind="cache_hit",
                 position=completed_count,
                 total=total_files,
-                file=source_file.name,
+                file=f"{day_input.day:%Y-%m-%d}（{len(day_input.fragments)} 個分片）",
             )
         else:
-            pending.append((parsed, source_file))
+            pending.append(day_input)
 
     if config.workers == 1 or len(pending) <= 1:
-        for parsed, source_file in pending:
+        for day_input in pending:
             if cancel_event and cancel_event.is_set():
                 raise CancelledError("使用者已取消")
             emit(
@@ -977,32 +1063,31 @@ def process_month(
                 kind="file_start",
                 position=completed_count + 1,
                 total=total_files,
-                file=source_file.name,
+                file=f"{day_input.day:%Y-%m-%d}（{len(day_input.fragments)} 個分片）",
             )
-            result = process_source_file(
-                source_file,
-                parsed,
+            result = process_day_input(
+                day_input,
                 config,
                 callback=callback,
                 cancel_event=cancel_event,
             )
-            processed[parsed] = result
-            save_cached_day(source_file, parsed, config, result)
+            processed[day_input.day] = result
+            save_cached_day(day_input, config, result)
             completed_count += 1
             emit(
                 callback,
                 kind="file_done",
                 position=completed_count,
                 total=total_files,
-                file=source_file.name,
+                file=f"{day_input.day:%Y-%m-%d}（{len(day_input.fragments)} 個分片）",
                 seconds=result.elapsed_seconds,
             )
     elif pending:
         emit(callback, kind="parallel_start", workers=config.workers, total=len(pending))
         with concurrent.futures.ProcessPoolExecutor(max_workers=config.workers) as executor:
             futures = {
-                executor.submit(_process_file_worker, (source_file, parsed, config)): (parsed, source_file)
-                for parsed, source_file in pending
+                executor.submit(_process_day_worker, (day_input, config)): day_input
+                for day_input in pending
             }
             try:
                 for future in concurrent.futures.as_completed(futures):
@@ -1010,19 +1095,20 @@ def process_month(
                         for other in futures:
                             other.cancel()
                         raise CancelledError("使用者已取消")
-                    expected_day, source_file = futures[future]
+                    day_input = futures[future]
+                    expected_day = day_input.day
                     parsed, result = future.result()
                     if parsed != expected_day:
                         raise RuntimeError(f"平行處理日期不一致：{parsed} / {expected_day}")
                     processed[parsed] = result
-                    save_cached_day(source_file, parsed, config, result)
+                    save_cached_day(day_input, config, result)
                     completed_count += 1
                     emit(
                         callback,
                         kind="file_done",
                         position=completed_count,
                         total=total_files,
-                        file=source_file.name,
+                        file=f"{day_input.day:%Y-%m-%d}（{len(day_input.fragments)} 個分片）",
                         seconds=result.elapsed_seconds,
                     )
             except Exception:
@@ -1036,7 +1122,7 @@ def process_month(
         parsed = date(config.year, config.month, day_number)
         if parsed in processed:
             output.append(processed[parsed])
-        elif config.max_files is not None and parsed in month_files and parsed not in allowed_days:
+        elif config.max_files is not None and parsed in month_days and parsed not in allowed_days:
             output.append(empty_day_result(parsed, "測試模式未處理此檔"))
         else:
             output.append(empty_day_result(parsed))
@@ -1055,6 +1141,12 @@ def _excel_col(column_zero_based: int) -> str:
 
 def _safe_sheet_name(name: str) -> str:
     return re.sub(r"[\[\]:*?/\\]", "_", name)[:31]
+
+
+def _source_fragment_label(day_result: DayResult) -> str:
+    if not day_result.source_fragments:
+        return "缺檔"
+    return "、".join(path.name for path in day_result.source_fragments)
 
 
 def _stats(values: Iterable[float | None]) -> tuple[float | None, float | None, float | None, float | None]:
@@ -1231,7 +1323,7 @@ def write_monthly_workbook(
             final_formula = f'=IFERROR(IF(ISNUMBER({cell}3),{cell}3,IF(ISNUMBER({cell}2),{cell}2,"")),"")'
             sheet.write_formula(3, column, final_formula, formats["final"], selected if selected is not None else "")
             sheet.write(4, column, direction_result.status, status_format)
-            sheet.write(5, column, day_result.source_file.name if day_result.source_file else "缺檔", formats["note"])
+            sheet.write(5, column, _source_fragment_label(day_result), formats["note"])
 
             for list_position, candidate in enumerate(direction_result.candidates, start=1):
                 rank = candidate.rank or list_position
@@ -1425,7 +1517,7 @@ def write_monthly_workbook(
     log_sheet.set_column("B:B", 38)
     log_sheet.set_column("C:G", 14)
     log_sheet.set_column("H:H", 12)
-    source_count = sum(1 for day_result in day_results if day_result.source_file is not None)
+    source_count = sum(len(day_result.source_fragments) for day_result in day_results)
     for row, (label, value) in enumerate(
         (
             ("Port", config.port),
@@ -1440,7 +1532,7 @@ def write_monthly_workbook(
         log_sheet.write(4, column, header, formats["header"])
     for row, day_result in enumerate(day_results, start=5):
         log_sheet.write_datetime(row, 0, datetime.combine(day_result.day, datetime.min.time()), formats["date"])
-        log_sheet.write(row, 1, day_result.source_file.name if day_result.source_file else "缺檔", formats["body"])
+        log_sheet.write(row, 1, _source_fragment_label(day_result), formats["body"])
         for column, value in enumerate(
             (
                 day_result.rows_scanned,
@@ -1528,7 +1620,7 @@ def write_legacy_workbook(
                     sheet.write_number(1, 7 + direction_index, selected, number_format)
 
             spool_path = _legacy_spool_path(config, day_result.day)
-            if day_result.source_file is not None:
+            if day_result.source_fragments:
                 if not spool_path.is_file():
                     raise FileNotFoundError(
                         f"缺少 {day_result.day:%Y-%m-%d} 的原格式資料暫存檔；請重新執行該月份。"

@@ -11,9 +11,15 @@ import openpyxl
 
 from ais_monthly_app import (
     AppConfig,
+    DayInput,
     DIRECTION_ORDER,
     LEGACY_DIRECTION_ABBREVIATIONS,
     OPEN_SEA_INDEXES,
+    SourceFragment,
+    build_processing_job,
+    parse_source_filename,
+    process_day_input,
+    scan_source_files,
     select_cluster_from_sorted_rows,
 )
 
@@ -74,6 +80,63 @@ class SelectorBaselineTests(unittest.TestCase):
             )
             selected.append((result.selected, result.selected_rank, result.cluster_count))
         self.assertEqual(selected, [(20.0, 5, 3)] * 3)
+
+
+class FragmentCatalogTests(unittest.TestCase):
+    @staticmethod
+    def _write_fragment(path: Path, distances: list[float]) -> None:
+        workbook = openpyxl.Workbook(write_only=True)
+        sheet = workbook.create_sheet("AIS")
+        sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+        for distance in distances:
+            sheet.append([1, "East", 0.0, distance])
+        workbook.save(path)
+
+    def test_suffix_is_opaque_traceability_not_source_identity(self) -> None:
+        first = parse_source_filename("D&TMOK KLNG_20260601_11.xlsx")
+        second = parse_source_filename("D&TMOK KLNG_20260601_part-anything.xlsx")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual((first.port, first.day), (second.port, second.day))
+        self.assertEqual(first.suffix, "11")
+        self.assertEqual(second.suffix, "PART-ANYTHING")
+
+    def test_same_day_fragments_are_all_kept_and_union_selected(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first_path = folder / "D&TMOK KLNG_20260601_11.xlsx"
+            second_path = folder / "D&TMOK KLNG_20260601_23.xlsx"
+            self._write_fragment(first_path, [100.0, 99.0])
+            self._write_fragment(second_path, [98.0])
+
+            catalog, warnings = scan_source_files(folder)
+            day_input = catalog["KLNG"][dt.date(2026, 6, 1)]
+            self.assertEqual(
+                [fragment.path.name for fragment in day_input.fragments],
+                [first_path.name, second_path.name],
+            )
+            self.assertTrue(any("合併 2 個來源分片" in warning for warning in warnings["KLNG"]))
+
+            config = AppConfig(
+                input_dir=folder,
+                output_path=folder / "result.xlsx",
+                port="KLNG",
+                year=2026,
+                month=6,
+                top_candidates=3,
+            )
+            result = process_day_input(day_input, config)
+            self.assertEqual(result.source_fragments, (first_path, second_path))
+            self.assertIsNone(result.source_file)
+            self.assertEqual(result.rows_scanned, 3)
+            self.assertEqual(result.directions["北"].selected, 100.0)
+
+            job = build_processing_job(config)
+            self.assertEqual(len(job.days), 1)
+            self.assertEqual(len(job.days[0].fragments), 2)
+            self.assertEqual(len(job.files), 2)
 
 
 class ExternalJuneContractTests(unittest.TestCase):

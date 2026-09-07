@@ -1,24 +1,16 @@
 # GitHub Release 模板
 
-本文件定義 AIS 32 方位月報工具的固定 Release 格式。未來版本原則上沿用此結構，避免每次發布重新設計版面。
-
-# AIS 32 方位月報工具 vX.Y.Z
+本文件定義 AIS 32 方位月報工具的固定 Release 格式。未來版本原則上沿用既有 v1.4.0 的版型與章節順序，不再每版重新設計。
 
 一句話說明本版本最重要的變更與定位。
 
 ## 📥 下載
 
-Windows 一般使用者請下載正式 Windows 發布包：
+Windows 一般使用者請下載：
 
 `AIS_32_Direction_Monthly_Report_vX.Y.Z.zip`
 
-解壓縮後執行：
-
-`AIS_32方位月報工具.exe`
-
-不需要安裝 Python。
-
-> `Source code (zip)` 與 `Source code (tar.gz)` 是 GitHub 自動產生的原始碼封裝，不是一般 Windows 使用者的執行版。
+解壓縮後執行 `AIS_32方位月報工具.exe`，不需要安裝 Python。
 
 ## ✨ 本版重點
 
@@ -28,11 +20,11 @@ Windows 一般使用者請下載正式 Windows 發布包：
 
 ## ✅ 驗證
 
-- 自動測試：`X/X` 通過
-- Source smoke test：通過／未執行
-- Windows EXE smoke test：通過／未執行
-- GitHub Actions：通過／未執行
-- 真實資料 smoke test：通過／未執行／不適用
+- 自動測試：`X/X` 通過。
+- Source smoke test：通過／未執行。
+- Windows EXE smoke test：通過／未執行。
+- GitHub Actions：通過／未執行。
+- 真實資料 smoke test：通過／未執行／不適用。
 
 只填寫實際完成的驗證，不要推測或補寫。
 
@@ -57,7 +49,7 @@ EXE：
 
 ## 📋 完整變更
 
-完整版本變更請見 [`CHANGELOG.md`](../CHANGELOG.md)。
+詳見 repository 的 `CHANGELOG.md`。
 
 ---
 
@@ -75,7 +67,7 @@ EXE：
 - `AIS_32方位月報工具.exe`
 - `使用說明.txt`
 
-除非有明確理由，避免不同版本交替使用「單獨 EXE」、「ZIP」、「不同命名規則」等不同發布方式。既有歷史 Release 不為了排版一致而重寫 tag 或 commit；資產形式不同時應如實保留。
+除非有明確理由，避免不同版本交替使用「單獨 EXE」、「ZIP」或不同命名規則。既有歷史 Release 不為了排版一致而重寫 tag 或 commit；資產形式不同時應如實保留。
 
 ## 每次發布檢查清單
 

@@ -21,15 +21,18 @@ build/
 dist/
 *.spec
 
-# AIS inputs, outputs, and resumable caches
+# AIS inputs, outputs, analysis artifacts, and resumable caches
 *.xlsx
 *.xls
+*.xlsm
 *.csv
 *.tsv
+*.parquet
 *.bin
 .*_cache/
 .*_rows/
-*.building.xlsx
+.ais-*/
+*.building.*
 AIS月報_錯誤報告_*.txt
 
 # Editors and Windows

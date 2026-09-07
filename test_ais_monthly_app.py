@@ -77,7 +77,7 @@ class RuleTests(unittest.TestCase):
 
     def test_coastal_value_is_flagged(self) -> None:
         candidates = [Candidate(value, 247.5, index + 2) for index, value in enumerate((12.0, 11.8, 11.5))]
-        result = select_cluster("西南西", candidates, tolerance=0.10, cluster_size=3, over_cap_count=0, over_cap_max=None)
+        result = select_cluster("西南偏西", candidates, tolerance=0.10, cluster_size=3, over_cap_count=0, over_cap_max=None)
         self.assertEqual(result.status, "待複核")
 
     def test_full_numeric_search_can_find_cluster_below_saved_top_rows(self) -> None:

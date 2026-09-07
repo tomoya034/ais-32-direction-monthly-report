@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import openpyxl
+from test_direction_contracts import V150_DIRECTION_ORDER
 
 from ais_monthly_app import (
     APP_VERSION,
@@ -82,13 +83,13 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (root / "README.md").read_text(encoding="utf-8")
         usage = (root / "使用說明.txt").read_text(encoding="utf-8")
 
-        self.assertEqual(APP_VERSION, "1.5.0")
+        self.assertEqual(APP_VERSION, "1.5.1")
         self.assertEqual(version, APP_VERSION)
         self.assertEqual(project["project"]["version"], APP_VERSION)
-        self.assertIn("filevers=(1, 5, 0, 0)", version_info)
-        self.assertIn("prodvers=(1, 5, 0, 0)", version_info)
-        self.assertIn("v1.5.0", readme)
-        self.assertIn("v1.5.0", usage)
+        self.assertIn("filevers=(1, 5, 1, 0)", version_info)
+        self.assertIn("prodvers=(1, 5, 1, 0)", version_info)
+        self.assertIn("v1.5.1", readme)
+        self.assertIn("v1.5.1", usage)
 
 
 class SelectorBaselineTests(unittest.TestCase):
@@ -1025,9 +1026,13 @@ class ExternalJuneContractTests(unittest.TestCase):
                     self.assertEqual(result.rows_scanned, benchmark_by_day[day_key]["raw_rows"])
                     self.assertEqual(result.rows_accepted, measured["eligible_under_cap_rows"])
                     self.assertEqual(len(result.source_fragments), 2)
-                    for direction in DIRECTION_ORDER:
+                    expected_by_index = {
+                        index: expected["current_full"][old_label]
+                        for index, old_label in enumerate(V150_DIRECTION_ORDER)
+                    }
+                    for index, direction in enumerate(DIRECTION_ORDER):
                         actual_direction = result.directions[direction]
-                        expected_direction = expected["current_full"][direction]
+                        expected_direction = expected_by_index[index]
                         self.assertEqual(
                             (
                                 actual_direction.selected,

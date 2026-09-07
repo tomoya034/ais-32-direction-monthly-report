@@ -1,18 +1,18 @@
 # AIS 32 方位月報一鍵製作
 
 [![Tests](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml/badge.svg)](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v1.5.0-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.0)
+[![Release](https://img.shields.io/badge/release-v1.5.1-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.1)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 離線讀取 `D&TMOK <PORT>_YYYYMMDD_*.xlsx`，把同港別、同日期的任意數量檔案視為同一個 logical day，再一次產生 Modern research 分析及五份正式 Historical delivery 工作簿。檔名尾碼只供追溯，不代表固定來源或時段；程式不使用雲端 API，也不會上傳 AIS 資料。
 
-> 目前版本為 `1.5.0`。程式會自動完成目前月份工作流程，但 AIS 異常的研究判斷仍需由領域人員在唯一的 decision ledger 覆核。
+> 目前版本為 `1.5.1`。程式會自動完成目前月份工作流程，但 AIS 異常的研究判斷仍需由領域人員在唯一的 decision ledger 覆核。
 
 ![AIS 32 方位月報工具視窗](docs/images/app-window.png)
 
 ## 📥 下載與標準流程
 
-1. 從 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.0.zip`。
+1. 從 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.1.zip`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇原始月份資料夾；工具會從檔名辨識港別與年月。
 4. 按「開始全自動製作」。第一次執行會產生一份 Modern 分析與五份正式成果。
@@ -78,6 +78,10 @@ Period 是依每列實際時間切分，與 `_11`、`_23` 或其他尾碼無關�
 
 Modern logical-day final 與 Historical integrated 是兩種不同語意；因為群聚選值是非線性運算，前者不保證等於後者。
 
+32 方位中文名稱採中文維基百科[〈羅盤方位〉](https://zh.wikipedia.org/zh-tw/羅盤方位)表的「中文名」欄，不採「又名」欄。英文縮寫與 11.25° floor-bin index 不變；海向仍為「北至東南偏東、西南偏西至北微西，共 21 方位」。
+
+v1.5.1 的 cache version 為 5、review schema 為 `AIS_V15_REVIEW_2`；舊 cache 安全失效。v1.5.0 覆核 workbook 不相容，請由原始月份資料重新分析及覆核，以避免 decision direction 錯置；不提供自動 migration。Index-based normalized spool version 維持 1。
+
 ## 🧭 兩套 profile 與覆核契約
 
 - Modern research profile 預設訊息類型為 `1, 2, 3, 18, 19`，可在 GUI 或 `--message-types` 修改。
@@ -101,9 +105,9 @@ Modern logical-day final 與 Historical integrated 是兩種不同語意；因�
 ## 💾 快取、容量與失敗保護
 
 - 每完成一個 logical day 就保存帶來源簽章與 checksum 的結果及 normalized spool；來源 metadata、分析設定或 cache/spool schema 變更時，對應日會安全重算。
-- 目前採每個 logical day 串流讀取後，以 bounded worker 數進行記憶體內 compact sorting；實測六月最高量日仍在可接受資源內，因此 v1.5.0 不加入 external merge 複雜度。
+- 目前採每個 logical day 串流讀取後，以 bounded worker 數進行記憶體內 compact sorting；實測六月最高量日仍在可接受資源內，因此 v1.5.1 不加入 external merge 複雜度。
 - 五份成果先全部寫入 `.building.xlsx`，成功後才整組替換；替換失敗會復原原有五檔。
-- 每張 Excel 明細最多 `1,048,575` 筆資料列；超限會在發布前停止，絕不截斷。v1.5.0 不提供 split 模式。
+- 每張 Excel 明細最多 `1,048,575` 筆資料列；超限會在發布前停止，絕不截斷。v1.5.1 不提供 split 模式。
 - 失敗時會保留已驗證的每日快取，並在輸出資料夾建立 `AIS月報_錯誤報告_*.txt`。
 
 ## ⌨️ 命令列

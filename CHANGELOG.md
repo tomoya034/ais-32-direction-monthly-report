@@ -8,6 +8,23 @@
 
 尚無未發布變更。
 
+## [1.5.1] - 2026-09-07
+
+### Fixed
+
+- 32 方位中文名稱依中文維基百科〈羅盤方位〉「中文名」欄修正十個 label，包含 SEbE = 東南微東、SEbS = 東南微南。所有中文顯示與 coastal review 名稱同步更新；英文縮寫不變。
+- 舊中文 direction keys 的 cache version 由 4 升為 5。Review schema 升為 `AIS_V15_REVIEW_2`，明確拒絕 v1.5.0 覆核 workbook，要求由原始月份資料重新分析以避免 decision direction 錯置；不自動 migration。
+
+### Tests
+
+- 固定完整 index／abbreviation／中文名稱 mapping，涵蓋 32 方位、SEbE／SEbS、WSW coastal review、floor-bin、cache 失效與舊 review schema 拒絕。
+- 六月 numeric regression 以固定 index／abbreviation 比較，避免歷史中文 label 造成假 regression。
+
+### Unchanged
+
+- 11.25° floor-bin、32 index、21 海向、500 NM、10%／3 筆 selector、Modern／Historical profile、Period A/B 及 decision value contract 均不變。
+- Numeric binary normalized spool version 維持 1；五份正式成果的 detail MAX、small=big、integrated MAX 契約不變。
+
 ## [1.5.0] - 2026-09-07
 
 ### Added
@@ -102,7 +119,8 @@
 - Excel 圖表、待複核清單與人工覆核欄。
 - PyInstaller 單一 EXE 建置腳本及自動測試。
 
-[Unreleased]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v0.0.1...v1.3.0

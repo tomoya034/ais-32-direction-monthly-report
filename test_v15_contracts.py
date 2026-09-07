@@ -23,8 +23,10 @@ from ais_monthly_app import (
     _normalized_spool_path,
     build_default_decision_snapshot,
     build_processing_job,
+    finalize_review_workbook,
     parse_source_filename,
     process_day_input,
+    process_month,
     read_normalized_spool,
     read_review_decisions,
     resolve_decision_values,
@@ -412,7 +414,7 @@ class ReviewLedgerTests(unittest.TestCase):
             broken_formula = folder / "broken_formula.xlsx"
             shutil.copyfile(config.output_path, broken_formula)
             workbook = openpyxl.load_workbook(broken_formula)
-            workbook["決策台帳"]["H2"] = 1
+            workbook["決策台帳"]["H2"] = "=1"
             workbook.save(broken_formula)
             workbook.close()
             with self.assertRaisesRegex(ValueError, "Final value 公式已遭破壞"):
@@ -531,6 +533,106 @@ class ReviewLedgerTests(unittest.TestCase):
                 )
             finally:
                 workbook.close()
+
+    def test_finalize_review_validates_sources_and_regenerates_all_five(self) -> None:
+        import shutil
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_any.xlsx"
+            FragmentCatalogTests._write_records(
+                source,
+                [
+                    (1, 0, "A", 1, 50.0),
+                    (1, 1, "A", 1, 49.0),
+                    (1, 2, "B", 1, 48.0),
+                    (13, 0, "A", 3, 70.0),
+                    (13, 1, "A", 3, 69.0),
+                    (13, 2, "B", 3, 68.0),
+                ],
+            )
+            analysis = folder / "analysis.xlsx"
+            config = AppConfig(
+                folder,
+                analysis,
+                "KLNG",
+                2026,
+                6,
+                overwrite=True,
+            )
+            day_results, warnings = process_month(config)
+            snapshot = build_default_decision_snapshot(config, day_results)
+            write_monthly_workbook(config, day_results, warnings, snapshot)
+            june_first = next(result for result in day_results if result.day.day == 1)
+            replacement = next(
+                candidate
+                for candidate in june_first.period_directions[PERIOD_A]["北"].candidates
+                if math.isclose(candidate.distance, 49.0)
+            )
+
+            workbook = openpyxl.load_workbook(analysis)
+            ledger = workbook["決策台帳"]
+            period_a_row = next(
+                row
+                for row in range(2, ledger.max_row + 1)
+                if ledger.cell(row, 1).value == PERIOD_A
+                and ledger.cell(row, 2).value.day == 1
+                and ledger.cell(row, 3).value == "北"
+            )
+            logical_row = next(
+                row
+                for row in range(2, ledger.max_row + 1)
+                if ledger.cell(row, 1).value == "logical_day"
+                and ledger.cell(row, 2).value.day == 1
+                and ledger.cell(row, 3).value == "北"
+            )
+            ledger.cell(period_a_row, 6).value = replacement.candidate_id
+            ledger.cell(logical_row, 7).value = 999.0
+            workbook.save(analysis)
+            workbook.close()
+
+            paths = finalize_review_workbook(
+                analysis,
+                delivery_dir=folder / "finalized",
+                overwrite=True,
+            )
+            self.assertTrue(all(path.is_file() for path in paths.all_files()))
+
+            def cell(path: Path, coordinate: str):
+                result = openpyxl.load_workbook(path, read_only=True, data_only=True)
+                try:
+                    return result["總表"][coordinate].value
+                finally:
+                    result.close()
+
+            self.assertEqual(cell(paths.period_a_full, "B2"), 49.0)
+            self.assertEqual(cell(paths.period_a_summary, "B2"), 49.0)
+            self.assertEqual(cell(paths.period_b_full, "B2"), 70.0)
+            self.assertEqual(cell(paths.period_b_summary, "B2"), 70.0)
+            self.assertEqual(cell(paths.integrated_summary, "B2"), 70.0)
+
+            fake = folder / "fake_review.xlsx"
+            shutil.copyfile(analysis, fake)
+            workbook = openpyxl.load_workbook(fake)
+            workbook["決策台帳"].cell(period_a_row, 6).value = "not-a-source-candidate"
+            workbook.save(fake)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "實際來源候選"):
+                finalize_review_workbook(
+                    fake,
+                    delivery_dir=folder / "fake_delivery",
+                    overwrite=True,
+                )
+
+            stat = source.stat()
+            os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+            with self.assertRaisesRegex(ValueError, "已變更"):
+                finalize_review_workbook(
+                    analysis,
+                    delivery_dir=folder / "changed_source",
+                    overwrite=True,
+                )
 
 
 class ExternalJuneContractTests(unittest.TestCase):

@@ -21,6 +21,7 @@ from ais_monthly_app import (
     default_output_directory,
     default_worker_count,
     detect_source_catalog,
+    derive_delivery_paths,
     derive_legacy_output_path,
     degree_to_direction_index,
     friendly_error_message,
@@ -51,7 +52,7 @@ class RuleTests(unittest.TestCase):
             (folder / "D&TMOK KLNG_20260501_23.xlsx").touch()
             self.assertEqual(resolve_source_month(folder), (2026, 5, 1))
             self.assertEqual(resolve_source_month(folder, 2026, 4), (2026, 4, 2))
-            self.assertEqual(month_option_label(2026, 4, 2), "2026 年 4 月（2 個每日檔）")
+        self.assertEqual(month_option_label(2026, 4, 2), "2026 年 4 月（2 天）")
 
     def test_requested_month_must_exist_in_source_filenames(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
@@ -182,21 +183,20 @@ class EndToEndTests(unittest.TestCase):
             workbook.save(second_source)
 
             output = folder / "result.xlsx"
-            legacy_output = folder / "result_legacy.xlsx"
             config = AppConfig(
                 input_dir=folder,
                 output_path=output,
                 port="KLNG",
                 year=2026,
                 month=4,
-                legacy_output_path=legacy_output,
                 top_candidates=10,
                 workers=2,
                 overwrite=True,
             )
             run_pipeline(config)
             self.assertTrue(output.exists())
-            self.assertTrue(legacy_output.exists())
+            delivery = derive_delivery_paths(config)
+            self.assertTrue(all(path.exists() for path in delivery.all_files()))
 
             events = []
             run_pipeline(config, callback=events.append)
@@ -216,21 +216,30 @@ class EndToEndTests(unittest.TestCase):
             finally:
                 result.close()
 
-            legacy = openpyxl.load_workbook(legacy_output, read_only=False, data_only=False)
+            legacy = openpyxl.load_workbook(delivery.period_b_full, read_only=False, data_only=False)
             try:
                 self.assertIn("4月1日", legacy.sheetnames)
                 self.assertIn("總表", legacy.sheetnames)
                 self.assertIn("工作", legacy.sheetnames)
-                self.assertEqual(legacy["4月1日"]["A2"].value, 600.0)
+                self.assertEqual(legacy["4月1日"]["A2"].value, 80.0)
                 self.assertEqual(legacy["4月1日"]["C2"].value, "北")
-                self.assertEqual(legacy["4月1日"]["H2"].value, 80.0)
-                self.assertEqual(legacy["4月1日"]["AD2"].value, 12.0)
+                self.assertIn("MAXIFS", legacy["4月1日"]["H2"].value)
+                self.assertIn("COUNTIF", legacy["4月1日"]["AD2"].value)
                 self.assertIn("'4月1日'!H2", str(legacy["總表"]["B2"].value))
                 self.assertIsNone(legacy["總表"]["M2"].value)
                 self.assertIsNone(legacy["總表"]["M33"].value)
                 self.assertEqual(legacy["工作"].sheet_state, "hidden")
             finally:
                 legacy.close()
+
+            legacy_values = openpyxl.load_workbook(
+                delivery.period_b_full, read_only=True, data_only=True
+            )
+            try:
+                self.assertEqual(legacy_values["4月1日"]["H2"].value, 80.0)
+                self.assertIsNone(legacy_values["4月1日"]["AD2"].value)
+            finally:
+                legacy_values.close()
 
 
 class MultiPortTests(unittest.TestCase):
@@ -323,11 +332,40 @@ class MultiPortTests(unittest.TestCase):
                         "--input", str(folder),
                         "--output", str(folder / "result.xlsx"),
                         "--port", "hwln",
+                        "--max-days", "1",
                     ]
                 )
             self.assertEqual(exit_code, 0)
             config = mocked_run.call_args.args[0]
             self.assertEqual((config.port, config.year, config.month), ("HWLN", 2026, 1))
+            self.assertEqual(config.max_days, 1)
+
+    def test_cli_finalize_is_separate_from_source_analysis(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            reviewed = folder / "reviewed.xlsx"
+            delivery = folder / "delivery"
+            completed = mock.Mock()
+            completed.all_files.return_value = (delivery / "one.xlsx", delivery / "two.xlsx")
+            with mock.patch(
+                "ais_monthly_app.finalize_review_workbook", return_value=completed
+            ) as mocked_finalize:
+                exit_code = main(
+                    [
+                        "--finalize-from",
+                        str(reviewed),
+                        "--delivery-dir",
+                        str(delivery),
+                        "--overwrite",
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            mocked_finalize.assert_called_once_with(
+                reviewed,
+                delivery_dir=delivery,
+                overwrite=True,
+                callback=mock.ANY,
+            )
 
     def test_output_names_are_port_aware(self) -> None:
         modern = Path(default_output_filename("hwln", 2026, 1))

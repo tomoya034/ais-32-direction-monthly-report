@@ -223,6 +223,7 @@ class AppConfig:
     message_types: tuple[int, ...] = (1, 2, 3, 18, 19)
     workers: int = 1
     overwrite: bool = False
+    max_days: int | None = None
     max_files: int | None = None
 
     def __post_init__(self) -> None:
@@ -246,7 +247,17 @@ class AppConfig:
         if not self.message_types:
             raise ValueError("至少要指定一個 AIS 訊息類型。")
         if not 1 <= self.workers <= 8:
-            raise ValueError("平行檔案數必須介於 1 到 8。")
+            raise ValueError("平行日期數必須介於 1 到 8。")
+        if self.max_days is not None and self.max_days < 1:
+            raise ValueError("--max-days 必須大於 0。")
+        if self.max_files is not None and self.max_files < 1:
+            raise ValueError("--max-files 必須大於 0。")
+        if (
+            self.max_days is not None
+            and self.max_files is not None
+            and self.max_days != self.max_files
+        ):
+            raise ValueError("--max-days 與 deprecated --max-files 不可指定不同數值。")
         if self.output_path.suffix.lower() != ".xlsx":
             raise ValueError("輸出檔必須是 .xlsx。")
         if self.legacy_output_path is not None and self.legacy_output_path.suffix.lower() != ".xlsx":
@@ -257,6 +268,14 @@ class AppConfig:
             raise FileExistsError(f"輸出檔已存在：{self.output_path}")
         if self.legacy_output_path is not None and self.legacy_output_path.exists() and not self.overwrite:
             raise FileExistsError(f"原格式相容版已存在：{self.legacy_output_path}")
+        if not self.overwrite:
+            existing_delivery = [
+                path for path in derive_delivery_paths(self).all_files() if path.exists()
+            ]
+            if existing_delivery:
+                raise FileExistsError(
+                    "正式交付檔已存在：" + "、".join(path.name for path in existing_delivery)
+                )
 
 
 @dataclass(frozen=True)
@@ -413,7 +432,7 @@ def detect_available_months(folder: Path, port: str | None = None) -> list[tuple
 
 
 def month_option_label(year: int, month: int, count: int) -> str:
-    return f"{year} 年 {month} 月（{count} 個每日檔）"
+    return f"{year} 年 {month} 月（{count} 天）"
 
 
 def resolve_source_period(
@@ -1156,17 +1175,12 @@ def _process_day_worker(arguments: tuple[DayInput, AppConfig]) -> tuple[date, Da
 
 
 def preflight_output_space(config: AppConfig, source_files: Iterable[Path]) -> tuple[int, int | None]:
-    targets = [config.output_path]
-    if config.legacy_output_path is not None:
-        targets.append(config.legacy_output_path)
+    targets = [config.output_path, derive_delivery_paths(config).root]
     for target in targets:
         target.parent.mkdir(parents=True, exist_ok=True)
 
     source_size = sum(path.stat().st_size for path in source_files)
-    if config.legacy_output_path is None:
-        required = max(256 * 1024**2, int(source_size * 0.08))
-    else:
-        required = max(1536 * 1024**2, int(source_size * 0.55))
+    required = max(1536 * 1024**2, int(source_size * 0.55))
     try:
         free = shutil.disk_usage(config.output_path.parent).free
     except OSError:
@@ -1463,8 +1477,9 @@ def process_month(
     emit(callback, kind="preflight", required_bytes=required, free_bytes=free)
 
     ordered_days = list(job.days)
-    if config.max_files is not None:
-        ordered_days = ordered_days[: config.max_files]
+    day_limit = config.max_days if config.max_days is not None else config.max_files
+    if day_limit is not None:
+        ordered_days = ordered_days[:day_limit]
         allowed_days = {day_input.day for day_input in ordered_days}
     else:
         allowed_days = set(month_days)
@@ -1556,8 +1571,8 @@ def process_month(
         parsed = date(config.year, config.month, day_number)
         if parsed in processed:
             output.append(processed[parsed])
-        elif config.max_files is not None and parsed in month_days and parsed not in allowed_days:
-            output.append(empty_day_result(parsed, "測試模式未處理此檔"))
+        elif day_limit is not None and parsed in month_days and parsed not in allowed_days:
+            output.append(empty_day_result(parsed, "測試模式未處理此 logical day"))
         else:
             output.append(empty_day_result(parsed))
             warnings.append(f"缺少 {parsed:%Y-%m-%d} 的來源檔")
@@ -1626,6 +1641,41 @@ def build_default_decision_snapshot(
     )
 
 
+def validate_decision_snapshot_contract(
+    snapshot: DecisionSnapshot,
+    config: AppConfig,
+    day_results: Sequence[DayResult],
+) -> None:
+    if (snapshot.port, snapshot.year, snapshot.month) != (
+        config.port,
+        config.year,
+        config.month,
+    ):
+        raise ValueError("決策 snapshot 的港別／月份與處理工作不一致。")
+    keys = [
+        (decision.scope, decision.day, decision.direction)
+        for decision in snapshot.decisions
+    ]
+    if len(keys) != len(set(keys)):
+        raise ValueError("決策 snapshot 含有重複的 day/scope/direction。")
+    expected = {
+        (scope, day_result.day, direction)
+        for day_result in day_results
+        for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B)
+        for direction in OPEN_SEA_DIRECTIONS
+    }
+    actual = set(keys)
+    if actual != expected:
+        missing = sorted(expected - actual, key=lambda item: (item[1], item[0], item[2]))
+        extra = sorted(actual - expected, key=lambda item: (item[1], item[0], item[2]))
+        details: list[str] = []
+        if missing:
+            details.append(f"缺少 {len(missing)} 筆（例如 {missing[0]}）")
+        if extra:
+            details.append(f"多出 {len(extra)} 筆（例如 {extra[0]}）")
+        raise ValueError("決策 snapshot 不完整：" + "；".join(details))
+
+
 def _display_candidate_catalog(
     day_results: Sequence[DayResult],
 ) -> dict[tuple[str, date, str], dict[str, Candidate]]:
@@ -1642,12 +1692,35 @@ def _display_candidate_catalog(
     return catalog
 
 
+def _decision_final_formula(
+    scope: str,
+    excel_row: int,
+    candidate_last_excel_row: int,
+) -> str:
+    candidate_lookup = (
+        f"IFERROR(INDEX('候選清單'!$F$2:$F${candidate_last_excel_row},"
+        f"MATCH(F{excel_row},'候選清單'!$E$2:$E${candidate_last_excel_row},0)),"
+        '"#INVALID_CANDIDATE")'
+    )
+    if scope == LOGICAL_DAY:
+        return (
+            f'=IF(ISNUMBER(G{excel_row}),G{excel_row},'
+            f'IF(F{excel_row}="","",{candidate_lookup}))'
+        )
+    return (
+        f'=IF(G{excel_row}<>"","#INVALID_PERIOD_NUMERIC",'
+        f'IF(F{excel_row}="","",{candidate_lookup}))'
+    )
+
+
 def resolve_decision_values(
     snapshot: DecisionSnapshot,
     day_results: Sequence[DayResult],
+    config: AppConfig | None = None,
 ) -> dict[tuple[str, date, str], float | None]:
     catalog = _display_candidate_catalog(day_results)
     values: dict[tuple[str, date, str], float | None] = {}
+    unresolved: dict[tuple[str, date, str], str] = {}
     for decision in snapshot.decisions:
         key = (decision.scope, decision.day, decision.direction)
         if decision.scope in (PERIOD_A, PERIOD_B) and decision.forced_numeric is not None:
@@ -1664,11 +1737,51 @@ def resolve_decision_values(
             continue
         candidate = catalog.get(key, {}).get(decision.candidate_id)
         if candidate is None:
-            raise ValueError(
-                f"{decision.day} {decision.scope} {decision.direction} 的 candidate ID "
-                f"{decision.candidate_id} 不在可驗證候選清單。"
-            )
-        values[key] = candidate.distance
+            unresolved[key] = decision.candidate_id
+        else:
+            values[key] = candidate.distance
+    if unresolved and config is not None:
+        results_by_day = {result.day: result for result in day_results}
+        unresolved_days = sorted({key[1] for key in unresolved})
+        for parsed_day in unresolved_days:
+            day_result = results_by_day.get(parsed_day)
+            if day_result is None or not day_result.fragment_info:
+                continue
+            spool_path = _normalized_spool_path(config, parsed_day)
+            if not spool_path.is_file():
+                raise FileNotFoundError(f"缺少 {parsed_day} normalized spool，無法驗證 candidate ID。")
+            if day_result.spool_sha256 and _file_sha256(spool_path) != day_result.spool_sha256:
+                raise ValueError(f"{parsed_day} normalized spool checksum 不符。")
+            _counts, records = read_normalized_spool(spool_path)
+            for direction_index, record in records:
+                if record.distance > config.max_distance:
+                    continue
+                direction = DIRECTION_ORDER[direction_index]
+                possible_scopes: list[str] = []
+                if record.msg_type in config.message_types:
+                    possible_scopes.append(LOGICAL_DAY)
+                if record.msg_type in HISTORICAL_MESSAGE_TYPES:
+                    possible_scopes.append(record.period)
+                if not possible_scopes:
+                    continue
+                fragment_index = record.source_key >> 32
+                if fragment_index >= len(day_result.fragment_info):
+                    raise ValueError(f"{parsed_day} normalized spool 的 fragment 索引無效。")
+                fragment = day_result.fragment_info[fragment_index]
+                candidate_id = _candidate_id(fragment, record)
+                for scope in possible_scopes:
+                    key = (scope, parsed_day, direction)
+                    if unresolved.get(key) == candidate_id:
+                        values[key] = record.distance
+                        unresolved.pop(key, None)
+                if not any(key[1] == parsed_day for key in unresolved):
+                    break
+    if unresolved:
+        key, candidate_id = next(iter(unresolved.items()))
+        raise ValueError(
+            f"{key[1]} {key[0]} {key[2]} 的 candidate ID {candidate_id} "
+            "不是該 day/scope/direction/profile 的實際來源候選。"
+        )
     return values
 
 
@@ -1680,8 +1793,9 @@ def read_review_decisions(
 ) -> DecisionSnapshot:
     workbook = openpyxl.load_workbook(workbook_path, read_only=False, data_only=False)
     try:
-        if "系統資料" not in workbook.sheetnames or "決策台帳" not in workbook.sheetnames:
-            raise ValueError("不是 v1.5.0 覆核 workbook：缺少系統資料或決策台帳。")
+        required_sheets = {"系統資料", "決策台帳", "候選清單"}
+        if not required_sheets.issubset(workbook.sheetnames):
+            raise ValueError("不是 v1.5.0 覆核 workbook：缺少系統資料、決策台帳或候選清單。")
         system = workbook["系統資料"]
         metadata = {
             str(system.cell(row=row, column=1).value): system.cell(row=row, column=2).value
@@ -1700,6 +1814,7 @@ def read_review_decisions(
         year, month = map(int, match.groups())
 
         ledger = workbook["決策台帳"]
+        candidate_last_excel_row = max(workbook["候選清單"].max_row, 2)
         expected_headers = [
             "Scope",
             "日期",
@@ -1753,7 +1868,8 @@ def read_review_decisions(
                 if candidate_id not in candidate_catalog.get(key, set()):
                     raise ValueError(f"決策台帳 F{row} 的 candidate ID 不屬於該 day/period/direction。")
             final_formula = ledger.cell(row=row, column=8).value
-            if not isinstance(final_formula, str) or not final_formula.startswith("="):
+            expected_formula = _decision_final_formula(scope, row, candidate_last_excel_row)
+            if final_formula != expected_formula:
                 raise ValueError(f"決策台帳 H{row} 的 Final value 公式已遭破壞。")
             note_value = ledger.cell(row=row, column=10).value
             decisions.append(
@@ -1814,16 +1930,11 @@ def write_monthly_workbook(
 ) -> Path:
     if decision_snapshot is None:
         decision_snapshot = build_default_decision_snapshot(config, day_results)
-    if (
-        decision_snapshot.port != config.port
-        or decision_snapshot.year != config.year
-        or decision_snapshot.month != config.month
-    ):
-        raise ValueError("決策 snapshot 與目前港別／月份不一致。")
+    validate_decision_snapshot_contract(decision_snapshot, config, day_results)
     expected_manifest = source_manifest_hash(config, day_results)
     if decision_snapshot.source_manifest_hash != expected_manifest:
         raise ValueError("決策 snapshot 的來源 fragment manifest 不一致。")
-    decision_values = resolve_decision_values(decision_snapshot, day_results)
+    decision_values = resolve_decision_values(decision_snapshot, day_results, config)
     decisions_by_key = decision_snapshot.by_key()
     warnings = list(warnings) + [
         f"{day_result.day:%Y-%m-%d}：{diagnostic}"
@@ -2041,10 +2152,6 @@ def write_monthly_workbook(
     ledger.set_column("J:J", 42)
     decision_row_lookup: dict[tuple[str, date, str], int] = {}
     candidate_last_excel_row = max(candidate_row, 2)
-    lookup_formula = (
-        f"IFERROR(INDEX('候選清單'!$F$2:$F${candidate_last_excel_row},"
-        f"MATCH(F{{row}},'候選清單'!$E$2:$E${candidate_last_excel_row},0)),\"#INVALID_CANDIDATE\")"
-    )
     for ledger_row, decision in enumerate(decision_snapshot.decisions, start=1):
         key = (decision.scope, decision.day, decision.direction)
         decision_row_lookup[key] = ledger_row + 1
@@ -2075,16 +2182,9 @@ def write_monthly_workbook(
         else:
             ledger.write_number(ledger_row, 6, decision.forced_numeric, formats["ledger_input"])
         excel_row = ledger_row + 1
-        candidate_lookup = lookup_formula.format(row=excel_row)
-        if decision.scope == LOGICAL_DAY:
-            formula = (
-                f'=IF(ISNUMBER(G{excel_row}),G{excel_row},IF(F{excel_row}="","",{candidate_lookup}))'
-            )
-        else:
-            formula = (
-                f'=IF(G{excel_row}<>"","#INVALID_PERIOD_NUMERIC",'
-                f'IF(F{excel_row}="","",{candidate_lookup}))'
-            )
+        formula = _decision_final_formula(
+            decision.scope, excel_row, candidate_last_excel_row
+        )
         final_value = decision_values[key]
         ledger.write_formula(
             ledger_row,
@@ -2107,6 +2207,12 @@ def write_monthly_workbook(
         ("Source manifest SHA-256", decision_snapshot.source_manifest_hash),
         ("Modern message types", ",".join(map(str, config.message_types))),
         ("Historical delivery message types", ",".join(map(str, HISTORICAL_MESSAGE_TYPES))),
+        ("Analysis workbook path", str(config.output_path.resolve())),
+        ("Input directory", str(config.input_dir)),
+        ("Max distance NM", config.max_distance),
+        ("Cluster tolerance", config.tolerance),
+        ("Cluster size", config.cluster_size),
+        ("Top candidates", config.top_candidates),
         ("Decision count", len(decision_snapshot.decisions)),
     ]
     for system_row, (label, value) in enumerate(system_rows):
@@ -2661,11 +2767,12 @@ def derive_delivery_paths(config: AppConfig, root: Path | None = None) -> Delive
 
 
 def _period_values(
+    config: AppConfig,
     snapshot: DecisionSnapshot,
     day_results: Sequence[DayResult],
     scope: str,
 ) -> dict[tuple[date, str], float | None]:
-    resolved = resolve_decision_values(snapshot, day_results)
+    resolved = resolve_decision_values(snapshot, day_results, config)
     return {
         (day_result.day, direction): resolved.get((scope, day_result.day, direction))
         for day_result in day_results
@@ -3012,6 +3119,7 @@ def write_delivery_workbooks(
 ) -> DeliveryPaths:
     paths = derive_delivery_paths(config, root)
     paths.root.mkdir(parents=True, exist_ok=True)
+    validate_decision_snapshot_contract(snapshot, config, day_results)
     if not config.overwrite:
         existing = [path for path in paths.all_files() if path.exists()]
         if existing:
@@ -3019,8 +3127,8 @@ def write_delivery_workbooks(
     expected_manifest = source_manifest_hash(config, day_results)
     if snapshot.source_manifest_hash != expected_manifest:
         raise ValueError("決策 snapshot 與 normalized spool manifest 不一致。")
-    period_a = _period_values(snapshot, day_results, PERIOD_A)
-    period_b = _period_values(snapshot, day_results, PERIOD_B)
+    period_a = _period_values(config, snapshot, day_results, PERIOD_A)
+    period_b = _period_values(config, snapshot, day_results, PERIOD_B)
     integrated = _integrated_period_values(day_results, period_a, period_b)
 
     for day_result in day_results:
@@ -3048,15 +3156,19 @@ def write_delivery_workbooks(
         _write_period_full_workbook(
             temporary[paths.period_b_full], config, day_results, PERIOD_B, period_b, cancel_event
         )
+        emit(callback, kind="delivery_file_done", position=1, total=5, file=paths.period_b_full.name)
         _write_period_full_workbook(
             temporary[paths.period_a_full], config, day_results, PERIOD_A, period_a, cancel_event
         )
+        emit(callback, kind="delivery_file_done", position=2, total=5, file=paths.period_a_full.name)
         _write_summary_workbook(
             temporary[paths.period_b_summary], config, day_results, period_b
         )
+        emit(callback, kind="delivery_file_done", position=3, total=5, file=paths.period_b_summary.name)
         _write_summary_workbook(
             temporary[paths.period_a_summary], config, day_results, period_a
         )
+        emit(callback, kind="delivery_file_done", position=4, total=5, file=paths.period_a_summary.name)
         _write_summary_workbook(
             temporary[paths.integrated_summary],
             config,
@@ -3064,6 +3176,7 @@ def write_delivery_workbooks(
             integrated,
             integrated_inputs=(period_a, period_b),
         )
+        emit(callback, kind="delivery_file_done", position=5, total=5, file=paths.integrated_summary.name)
         for final_path in paths.all_files():
             os.replace(temporary[final_path], final_path)
     except Exception:
@@ -3077,6 +3190,119 @@ def write_delivery_workbooks(
     return paths
 
 
+def _review_workbook_metadata(path: Path) -> dict[str, object]:
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    try:
+        if "系統資料" not in workbook.sheetnames:
+            raise ValueError("不是 v1.5.0 覆核 workbook：缺少系統資料。")
+        sheet = workbook["系統資料"]
+        return {
+            str(row[0]): row[1]
+            for row in sheet.iter_rows(min_col=1, max_col=2, values_only=True)
+            if row[0] is not None
+        }
+    finally:
+        workbook.close()
+
+
+def config_from_review_workbook(
+    path: Path,
+    *,
+    delivery_dir: Path | None = None,
+    overwrite: bool = False,
+) -> AppConfig:
+    metadata = _review_workbook_metadata(path)
+    if metadata.get("Schema") != REVIEW_WORKBOOK_SCHEMA:
+        raise ValueError("覆核 workbook schema 版本不相容。")
+    period = str(metadata.get("Period", ""))
+    match = re.fullmatch(r"(\d{4})-(\d{2})", period)
+    if match is None:
+        raise ValueError("覆核 workbook 的 Period metadata 無效。")
+    year, month = map(int, match.groups())
+    historical_types = parse_message_types(
+        str(metadata.get("Historical delivery message types", ""))
+    )
+    if historical_types != HISTORICAL_MESSAGE_TYPES:
+        raise ValueError("覆核 workbook 的 historical delivery profile 不相容。")
+    analysis_path = Path(str(metadata.get("Analysis workbook path", path)))
+    return AppConfig(
+        input_dir=Path(str(metadata.get("Input directory", path.parent))),
+        output_path=analysis_path,
+        port=str(metadata.get("Port", "")),
+        year=year,
+        month=month,
+        delivery_dir=delivery_dir,
+        max_distance=float(metadata.get("Max distance NM", 500.0)),
+        tolerance=float(metadata.get("Cluster tolerance", 0.10)),
+        cluster_size=int(metadata.get("Cluster size", 3)),
+        top_candidates=int(metadata.get("Top candidates", 50)),
+        message_types=parse_message_types(str(metadata.get("Modern message types", "1,2,3,18,19"))),
+        workers=1,
+        overwrite=overwrite,
+    )
+
+
+def load_finalization_results(config: AppConfig) -> list[DayResult]:
+    try:
+        job = build_processing_job(config)
+    except ValueError as error:
+        raise ValueError("找不到覆核 workbook 對應的目前來源 fragments。") from error
+    current_days = {day_input.day: day_input for day_input in job.days}
+    results: list[DayResult] = []
+    days_in_month = calendar.monthrange(config.year, config.month)[1]
+    for day_number in range(1, days_in_month + 1):
+        parsed_day = date(config.year, config.month, day_number)
+        day_input = current_days.get(parsed_day)
+        if day_input is None:
+            results.append(empty_day_result(parsed_day))
+            continue
+        result = load_cached_day(day_input, config)
+        if result is None:
+            raise ValueError(
+                f"{parsed_day} 的來源 fragment、分析設定、cache 或 normalized spool 已變更；"
+                "請先重新執行來源分析。"
+            )
+        results.append(result)
+    return results
+
+
+def finalize_review_workbook(
+    reviewed_workbook: Path,
+    *,
+    delivery_dir: Path | None = None,
+    overwrite: bool = False,
+    callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> DeliveryPaths:
+    config = config_from_review_workbook(
+        reviewed_workbook,
+        delivery_dir=delivery_dir,
+        overwrite=overwrite,
+    )
+    day_results = load_finalization_results(config)
+    manifest_hash = source_manifest_hash(config, day_results)
+    snapshot = read_review_decisions(
+        reviewed_workbook,
+        expected_manifest_hash=manifest_hash,
+    )
+    if (snapshot.port, snapshot.year, snapshot.month) != (
+        config.port,
+        config.year,
+        config.month,
+    ):
+        raise ValueError("覆核 decision ledger 與 workbook metadata 的港別／月份不一致。")
+    validate_decision_snapshot_contract(snapshot, config, day_results)
+    resolve_decision_values(snapshot, day_results, config)
+    return write_delivery_workbooks(
+        config,
+        day_results,
+        snapshot,
+        root=delivery_dir,
+        callback=callback,
+        cancel_event=cancel_event,
+    )
+
+
 def run_pipeline(
     config: AppConfig,
     callback: ProgressCallback | None = None,
@@ -3084,9 +3310,23 @@ def run_pipeline(
 ) -> Path:
     started = time.perf_counter()
     day_results, warnings = process_month(config, callback=callback, cancel_event=cancel_event)
-    output = write_monthly_workbook(config, day_results, warnings, callback=callback, cancel_event=cancel_event)
-    legacy_output = write_legacy_workbook(config, day_results, callback=callback, cancel_event=cancel_event)
-    files = [str(output)] + ([str(legacy_output)] if legacy_output is not None else [])
+    snapshot = build_default_decision_snapshot(config, day_results)
+    output = write_monthly_workbook(
+        config,
+        day_results,
+        warnings,
+        snapshot,
+        callback=callback,
+        cancel_event=cancel_event,
+    )
+    delivery = write_delivery_workbooks(
+        config,
+        day_results,
+        snapshot,
+        callback=callback,
+        cancel_event=cancel_event,
+    )
+    files = [str(output), *(str(path) for path in delivery.all_files())]
     emit(callback, kind="complete", file=str(output), files=files, seconds=time.perf_counter() - started)
     return output
 
@@ -3142,7 +3382,7 @@ def friendly_error_message(error: BaseException) -> str:
     if isinstance(error, (zipfile.BadZipFile, openpyxl.utils.exceptions.InvalidFileException)):
         return f"其中一個來源檔不是有效的 Excel .xlsx，可能下載未完成或檔案損壞。\n\n原始錯誤：{error}"
     if isinstance(error, MemoryError):
-        return "記憶體不足。請把「平行檔案數」降為 1 或 2，關閉其他大型程式後重跑；已完成日期可由快取續跑。"
+        return "記憶體不足。請把「平行日期數」降為 1 或 2，關閉其他大型程式後重跑；已完成日期可由快取續跑。"
     if isinstance(error, OSError):
         error_number = getattr(error, "errno", None)
         windows_error = getattr(error, "winerror", None)
@@ -3152,7 +3392,7 @@ def friendly_error_message(error: BaseException) -> str:
     if isinstance(error, ValueError):
         return str(error)
     if type(error).__name__ in {"BrokenProcessPool", "BrokenExecutor"}:
-        return "平行處理程序異常停止。請將「平行檔案數」降為 1 或 2 後重跑；已完成日期會沿用快取。"
+        return "平行處理程序異常停止。請將「平行日期數」降為 1 或 2 後重跑；已完成日期會沿用快取。"
     return (
         "發生未預期錯誤。程式已保留已完成日期的快取；請依錯誤報告中的檔名與訊息處理後重跑。\n\n"
         f"{type(error).__name__}: {error}"
@@ -3165,13 +3405,16 @@ def write_error_report(config: AppConfig, error: BaseException) -> Path | None:
         report = config.output_path.parent / f"AIS月報_錯誤報告_{datetime.now():%Y%m%d_%H%M%S}.txt"
         try:
             discovered, _warnings = discover_source_files(config.input_dir, config.port)
-            source_count: int | str = sum(
-                1
-                for parsed in discovered
+            month_inputs = [
+                day_input
+                for parsed, day_input in discovered.items()
                 if parsed.year == config.year and parsed.month == config.month
-            )
+            ]
+            source_days: int | str = len(month_inputs)
+            fragment_count: int | str = sum(len(item.fragments) for item in month_inputs)
         except (OSError, ValueError):
-            source_count = "無法判定"
+            source_days = "無法判定"
+            fragment_count = "無法判定"
         contents = [
             APP_TITLE,
             f"版本：{APP_VERSION}",
@@ -3179,9 +3422,10 @@ def write_error_report(config: AppConfig, error: BaseException) -> Path | None:
             f"來源：{config.input_dir}",
             f"港別：{config.port}",
             f"月份：{config.year}-{config.month:02d}",
-            f"來源檔數：{source_count}",
-            f"新版輸出：{config.output_path}",
-            f"原格式輸出：{config.legacy_output_path or '未要求'}",
+            f"Logical days：{source_days}",
+            f"來源 fragments：{fragment_count}",
+            f"Modern analysis：{config.output_path}",
+            f"正式五檔資料夾：{derive_delivery_paths(config).root}",
             "",
             "給使用者的說明：",
             friendly_error_message(error),
@@ -3222,8 +3466,7 @@ def launch_gui() -> None:
 
             self.source_var = tk.StringVar()
             self.output_var = tk.StringVar()
-            self.legacy_var = tk.BooleanVar(value=True)
-            self.legacy_path_var = tk.StringVar(value="將依新版檔名自動建立")
+            self.delivery_path_var = tk.StringVar(value="將依港別與月份固定建立 5 份正式成果")
             self.port_choice_var = tk.StringVar(value="請先選擇每日資料夾")
             self.month_choice_var = tk.StringVar(value="請先選擇每日資料夾")
             self.source_catalog: dict[str, list[tuple[int, int, int]]] = {}
@@ -3263,9 +3506,9 @@ def launch_gui() -> None:
             ttk.Label(files_box, text="輸出月報").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
             ttk.Entry(files_box, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", pady=5)
             ttk.Button(files_box, text="另存為…", command=self.choose_output).grid(row=1, column=2, padx=(8, 0), pady=5)
-            ttk.Checkbutton(files_box, text="同時產生原格式相容版", variable=self.legacy_var, command=self.update_legacy_path).grid(row=2, column=0, sticky="w", pady=5)
-            ttk.Label(files_box, textvariable=self.legacy_path_var, foreground="#5B6573").grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
-            self.output_var.trace_add("write", lambda *_args: self.update_legacy_path())
+            ttk.Label(files_box, text="五份正式交付（固定）").grid(row=2, column=0, sticky="w", pady=5)
+            ttk.Label(files_box, textvariable=self.delivery_path_var, foreground="#5B6573").grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
+            self.output_var.trace_add("write", lambda *_args: self.update_delivery_path())
 
             config_box = ttk.LabelFrame(container, text="2  港別、月份與判斷設定", style="Section.TLabelframe")
             config_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -3292,14 +3535,18 @@ def launch_gui() -> None:
                 ("群聚差距 %", self.tolerance_var, 7),
                 ("至少筆數", self.cluster_var, 5),
                 ("每方向候選", self.top_var, 6),
-                ("平行檔案數", self.workers_var, 5),
+                ("平行日期數", self.workers_var, 5),
             ]
             for column, (label, variable, width) in enumerate(labels):
                 ttk.Label(config_box, text=label).grid(row=2, column=column, sticky="w", padx=(10 if column else 0, 0))
                 ttk.Entry(config_box, textvariable=variable, width=width).grid(row=3, column=column, sticky="w", padx=(10 if column else 0, 0), pady=(3, 8))
-            ttk.Label(config_box, text="AIS 訊息類型").grid(row=4, column=0, sticky="w")
+            ttk.Label(config_box, text="Modern research 訊息類型").grid(row=4, column=0, sticky="w")
             ttk.Entry(config_box, textvariable=self.message_types_var, width=24).grid(row=4, column=1, sticky="w", padx=(10, 0))
-            ttk.Label(config_box, text="船舶位置預設 1,2,3,18,19；每日完成即保存快取，可中斷後續跑。", foreground="#5B6573").grid(row=4, column=2, columnspan=3, sticky="w", padx=(12, 0))
+            ttk.Label(
+                config_box,
+                text="只影響 logical-day modern；五份正式交付固定使用 historical 1,3,4,18,19。",
+                foreground="#5B6573",
+            ).grid(row=4, column=2, columnspan=3, sticky="w", padx=(12, 0))
 
             run_box = ttk.LabelFrame(container, text="3  一鍵執行", style="Section.TLabelframe")
             run_box.grid(row=2, column=0, sticky="nsew")
@@ -3309,8 +3556,14 @@ def launch_gui() -> None:
             button_row.grid(row=0, column=0, sticky="ew")
             self.start_button = ttk.Button(button_row, text="開始全自動製作", style="Primary.TButton", command=self.start)
             self.start_button.pack(side="left")
+            self.finalize_button = ttk.Button(
+                button_row,
+                text="讀取已覆核分析並重生五份成果",
+                command=self.finalize_review,
+            )
+            self.finalize_button.pack(side="left", padx=8)
             self.cancel_button = ttk.Button(button_row, text="取消", command=self.cancel, state="disabled")
-            self.cancel_button.pack(side="left", padx=8)
+            self.cancel_button.pack(side="left")
             self.open_button = ttk.Button(button_row, text="開啟輸出資料夾", command=self.open_output, state="disabled")
             self.open_button.pack(side="right")
             ttk.Label(run_box, textvariable=self.status_var, foreground="#17324D").grid(row=1, column=0, sticky="w", pady=(12, 3))
@@ -3380,9 +3633,9 @@ def launch_gui() -> None:
             else:
                 port_message = f"偵測到 {len(ports)} 個港別（{'、'.join(ports)}）；目前選擇 {selected_port}。"
             month_message = (
-                f"{year} 年 {month} 月，共 {count} 個每日檔。"
+                f"{year} 年 {month} 月，共 {count} 個 logical days。"
                 if len(catalog[selected_port]) == 1
-                else f"已選最新的 {year} 年 {month} 月，共 {count} 個每日檔；可由清單改選。"
+                else f"已選最新的 {year} 年 {month} 月，共 {count} 個 logical days；可由清單改選。"
             )
             message = f"{port_message} {month_message}"
             self.status_var.set(message)
@@ -3421,7 +3674,7 @@ def launch_gui() -> None:
             if selected is None:
                 return
             year, month, count = selected
-            message = f"已選定港別 {port}；月份清單已更新為該港別資料，預設 {year} 年 {month} 月（{count} 個每日檔）。"
+            message = f"已選定港別 {port}；月份清單已更新為該港別資料，預設 {year} 年 {month} 月（{count} 天）。"
             self.status_var.set(message)
             self.append_log(message)
 
@@ -3433,7 +3686,7 @@ def launch_gui() -> None:
             port = self.port_choice_var.get()
             default_name = default_output_filename(port, year, month)
             self.output_var.set(str(default_output_directory() / default_name))
-            self.status_var.set(f"已由檔名選定 {port} / {year} 年 {month} 月，共 {count} 個每日檔。")
+            self.status_var.set(f"已由檔名選定 {port} / {year} 年 {month} 月，共 {count} 天。")
             self.append_log(self.status_var.get())
 
         def choose_output(self) -> None:
@@ -3448,14 +3701,22 @@ def launch_gui() -> None:
             if selected:
                 self.output_var.set(selected)
 
-        def update_legacy_path(self) -> None:
+        def update_delivery_path(self) -> None:
             raw = self.output_var.get().strip()
-            if not self.legacy_var.get():
-                self.legacy_path_var.set("不產生原格式相容版")
-            elif raw:
-                self.legacy_path_var.set(str(derive_legacy_output_path(Path(raw))))
-            else:
-                self.legacy_path_var.set("將依新版檔名自動建立")
+            selected = self.month_options.get(self.month_choice_var.get())
+            port = self.port_choice_var.get()
+            if not raw or selected is None or port not in self.source_catalog:
+                self.delivery_path_var.set("將依港別與月份固定建立 5 份正式成果")
+                return
+            year, month, _count = selected
+            preview = AppConfig(
+                input_dir=Path(self.source_var.get().strip() or "."),
+                output_path=Path(raw),
+                port=port,
+                year=year,
+                month=month,
+            )
+            self.delivery_path_var.set(f"{derive_delivery_paths(preview).root}（5 份）")
 
         def build_config(self) -> AppConfig:
             source_text = self.source_var.get().strip()
@@ -3478,14 +3739,12 @@ def launch_gui() -> None:
                 self.refresh_detected_sources(source, announce=True, update_output=False)
                 raise ValueError("來源資料夾內容已變更，原選擇的月份已不存在；請重新確認港別與月份。")
             year, month, _count = selected
-            legacy_output = derive_legacy_output_path(output) if self.legacy_var.get() else None
             return AppConfig(
                 input_dir=source,
                 output_path=output,
                 port=port,
                 year=year,
                 month=month,
-                legacy_output_path=legacy_output,
                 max_distance=float(self.max_distance_var.get()),
                 tolerance=float(self.tolerance_var.get()) / 100.0,
                 cluster_size=int(self.cluster_var.get()),
@@ -3498,7 +3757,12 @@ def launch_gui() -> None:
         def start(self) -> None:
             try:
                 config = self.build_config()
-                existing = [path for path in (config.output_path, config.legacy_output_path) if path is not None and path.exists()]
+                delivery = derive_delivery_paths(config)
+                existing = [
+                    path
+                    for path in (config.output_path, *delivery.all_files())
+                    if path.exists()
+                ]
                 if existing:
                     listing = "\n".join(str(path) for path in existing)
                     if not messagebox.askyesno("覆寫確認", f"下列檔案已存在：\n{listing}\n\n要覆寫嗎？"):
@@ -3511,6 +3775,7 @@ def launch_gui() -> None:
             self.last_output = None
             self.last_outputs = []
             self.start_button.configure(state="disabled")
+            self.finalize_button.configure(state="disabled")
             self.cancel_button.configure(state="normal")
             self.open_button.configure(state="disabled")
             self.progress["value"] = 0
@@ -3520,10 +3785,12 @@ def launch_gui() -> None:
             source_count = selected[2] if selected is not None else 0
             self.append_log(f"Port: {config.port}")
             self.append_log(f"Period: {config.year}-{config.month:02d}")
-            self.append_log(f"Source files: {source_count}")
-            self.append_log(f"新版：{config.output_path}")
-            if config.legacy_output_path is not None:
-                self.append_log(f"原格式版：{config.legacy_output_path}")
+            job = build_processing_job(config)
+            fragment_count = sum(len(day_input.fragments) for day_input in job.days)
+            self.append_log(f"Logical days: {source_count}")
+            self.append_log(f"Source fragments: {fragment_count}")
+            self.append_log(f"Modern analysis：{config.output_path}")
+            self.append_log(f"正式五檔：{delivery.root}")
 
             def callback(payload: dict) -> None:
                 self.events.put(payload)
@@ -3531,10 +3798,87 @@ def launch_gui() -> None:
             def work() -> None:
                 try:
                     output = run_pipeline(config, callback=callback, cancel_event=self.cancel_event)
-                    outputs = [str(output)]
-                    if config.legacy_output_path is not None:
-                        outputs.append(str(config.legacy_output_path))
-                    self.events.put({"kind": "worker_success", "output": str(output), "outputs": outputs})
+                    outputs = [str(output), *(str(path) for path in delivery.all_files())]
+                    self.events.put(
+                        {
+                            "kind": "worker_success",
+                            "output": str(output),
+                            "outputs": outputs,
+                            "mode": "analysis",
+                        }
+                    )
+                except CancelledError as error:
+                    self.events.put({"kind": "worker_cancelled", "error": str(error)})
+                except Exception as error:
+                    report = write_error_report(config, error)
+                    self.events.put(
+                        {
+                            "kind": "worker_error",
+                            "error": friendly_error_message(error),
+                            "technical": f"{type(error).__name__}: {error}",
+                            "report": str(report) if report else None,
+                        }
+                    )
+
+            self.worker = threading.Thread(target=work, daemon=True)
+            self.worker.start()
+
+        def finalize_review(self) -> None:
+            reviewed = filedialog.askopenfilename(
+                title="選擇已覆核的新版分析 workbook",
+                filetypes=[("Excel 活頁簿", "*.xlsx")],
+            )
+            if not reviewed:
+                return
+            reviewed_path = Path(reviewed)
+            try:
+                config = config_from_review_workbook(reviewed_path, overwrite=True)
+                delivery = derive_delivery_paths(config)
+                existing = [path for path in delivery.all_files() if path.exists()]
+                if existing:
+                    listing = "\n".join(str(path) for path in existing)
+                    if not messagebox.askyesno(
+                        "覆寫確認",
+                        f"將依同一份 decision ledger 重新產生並覆寫：\n{listing}\n\n要繼續嗎？",
+                    ):
+                        return
+            except Exception as error:
+                messagebox.showerror("覆核檔錯誤", str(error))
+                return
+
+            self.cancel_event.clear()
+            self.last_output = None
+            self.last_outputs = []
+            self.start_button.configure(state="disabled")
+            self.finalize_button.configure(state="disabled")
+            self.cancel_button.configure(state="normal")
+            self.open_button.configure(state="disabled")
+            self.progress["value"] = 90
+            self.status_var.set("正在驗證覆核決策並重新產生五份正式成果…")
+            self.progress_text_var.set(reviewed_path.name)
+            self.append_log(f"已覆核分析：{reviewed_path}")
+            self.append_log(f"正式五檔：{delivery.root}")
+
+            def callback(payload: dict) -> None:
+                self.events.put(payload)
+
+            def work() -> None:
+                try:
+                    completed = finalize_review_workbook(
+                        reviewed_path,
+                        overwrite=True,
+                        callback=callback,
+                        cancel_event=self.cancel_event,
+                    )
+                    outputs = [str(path) for path in completed.all_files()]
+                    self.events.put(
+                        {
+                            "kind": "worker_success",
+                            "output": str(completed.integrated_summary),
+                            "outputs": outputs,
+                            "mode": "finalize",
+                        }
+                    )
                 except CancelledError as error:
                     self.events.put({"kind": "worker_cancelled", "error": str(error)})
                 except Exception as error:
@@ -3554,7 +3898,7 @@ def launch_gui() -> None:
         def cancel(self) -> None:
             self.cancel_event.set()
             self.cancel_button.configure(state="disabled")
-            self.status_var.set("正在安全停止；目前來源檔讀完或每 10,000 列會檢查一次…")
+            self.status_var.set("正在安全停止；目前 fragment 讀完或每 10,000 列會檢查一次…")
             self.append_log("已要求取消。")
 
         def poll_events(self) -> None:
@@ -3565,7 +3909,7 @@ def launch_gui() -> None:
                     if kind == "file_start":
                         position, total = int(payload["position"]), int(payload["total"])
                         self.progress["value"] = (position - 1) / max(total, 1) * 85
-                        self.status_var.set(f"處理第 {position}/{total} 檔：{payload['file']}")
+                        self.status_var.set(f"處理第 {position}/{total} 個 logical day：{payload['file']}")
                         self.progress_text_var.set("正在逐列讀取並保留各方位候選值")
                         self.append_log(self.status_var.get())
                     elif kind == "preflight":
@@ -3574,7 +3918,7 @@ def launch_gui() -> None:
                         free_text = f"，可用 {int(free_value) / 1024**3:.1f} GB" if free_value else ""
                         self.append_log(f"輸出空間預估至少 {required:.1f} GB{free_text}")
                     elif kind == "parallel_start":
-                        self.status_var.set(f"使用 {payload['workers']} 個處理程序平行讀取 {payload['total']} 個來源檔…")
+                        self.status_var.set(f"使用 {payload['workers']} 個處理程序平行讀取 {payload['total']} 個 logical days…")
                         self.append_log(self.status_var.get())
                     elif kind == "cache_hit":
                         position, total = int(payload["position"]), int(payload["total"])
@@ -3598,40 +3942,46 @@ def launch_gui() -> None:
                         self.progress["value"] = 88 + position / max(total, 1) * 10
                         self.progress_text_var.set(f"已建立 {payload['sheet']}（{position}/{total}）")
                     elif kind == "write_done":
-                        self.progress["value"] = 92 if self.legacy_var.get() else 99
+                        self.progress["value"] = 90
                         self.append_log(f"Excel 已寫入：{payload['file']}")
-                    elif kind == "legacy_write_start":
-                        self.progress["value"] = 92
-                        self.status_var.set("新版完成，正在製作原格式完整資料版…")
-                        self.progress_text_var.set(payload["file"])
+                    elif kind == "delivery_write_start":
+                        self.progress["value"] = 91
+                        self.status_var.set("正在由同一份 decision snapshot 製作五份正式成果…")
+                        self.progress_text_var.set("準備 Period A/B 明細、兩份小總表與整合總表")
                         self.append_log(self.status_var.get())
-                    elif kind == "legacy_sheet_written":
+                    elif kind == "delivery_file_done":
                         position, total = int(payload["position"]), int(payload["total"])
-                        self.progress["value"] = 92 + position / max(total, 1) * 7
-                        self.progress_text_var.set(
-                            f"原格式：{payload['sheet']}，寫入 {int(payload['rows']):,} 列（{position}/{total}）"
-                        )
-                    elif kind == "legacy_write_done":
+                        self.progress["value"] = 91 + position / max(total, 1) * 8
+                        self.progress_text_var.set(f"已完成暫存成果 {position}/{total}：{payload['file']}")
+                    elif kind == "delivery_write_done":
                         self.progress["value"] = 99
-                        self.append_log(f"原格式 Excel 已寫入：{payload['file']}")
+                        self.append_log("五份正式成果已一致完成並替換正式檔。")
                     elif kind == "complete":
                         self.progress_text_var.set(f"總耗時：{format_seconds(float(payload['seconds']))}")
                     elif kind == "worker_success":
                         self.last_output = Path(payload["output"])
                         self.last_outputs = [Path(value) for value in payload.get("outputs", [payload["output"]])]
                         self.progress["value"] = 100
-                        self.status_var.set("完成。新版分析版與原格式相容版均已產生。" if len(self.last_outputs) == 2 else "完成。新版分析月報已產生。")
+                        mode = payload.get("mode")
+                        if mode == "finalize":
+                            self.status_var.set("完成。已依覆核 decision ledger 重生五份正式成果。")
+                            final_note = "五份成果已使用同一份覆核決策重新產生。"
+                        else:
+                            self.status_var.set("完成。Modern 分析與五份正式成果均已產生。")
+                            final_note = "請先查看 Modern 分析的「決策台帳」；修改並存檔後可按覆核重生。"
                         for completed_output in self.last_outputs:
                             self.append_log(f"完成：{completed_output}")
                         self.start_button.configure(state="normal")
+                        self.finalize_button.configure(state="normal")
                         self.cancel_button.configure(state="disabled")
                         self.open_button.configure(state="normal")
                         listing = "\n".join(str(path) for path in self.last_outputs)
-                        messagebox.showinfo("製作完成", f"AIS 月報已完成：\n{listing}\n\n請先查看新版的「待複核」工作表。")
+                        messagebox.showinfo("製作完成", f"AIS 月報已完成：\n{listing}\n\n{final_note}")
                     elif kind == "worker_cancelled":
                         self.status_var.set("已取消；未覆寫正式輸出檔。")
                         self.append_log(payload["error"])
                         self.start_button.configure(state="normal")
+                        self.finalize_button.configure(state="normal")
                         self.cancel_button.configure(state="disabled")
                     elif kind == "worker_error":
                         self.status_var.set("製作失敗；請看下方錯誤。")
@@ -3639,6 +3989,7 @@ def launch_gui() -> None:
                         if payload.get("report"):
                             self.append_log(f"錯誤報告：{payload['report']}")
                         self.start_button.configure(state="normal")
+                        self.finalize_button.configure(state="normal")
                         self.cancel_button.configure(state="disabled")
                         report_note = f"\n\n完整錯誤報告：\n{payload['report']}" if payload.get("report") else ""
                         messagebox.showerror("製作失敗", payload["error"] + report_note)
@@ -3660,7 +4011,8 @@ def cli_progress(payload: dict) -> None:
     if kind == "job":
         print(f"Port: {payload['port']}", flush=True)
         print(f"Period: {payload['year']}-{int(payload['month']):02d}", flush=True)
-        print(f"Source files: {payload['source_count']}", flush=True)
+        print(f"Logical days: {payload['source_count']}", flush=True)
+        print(f"Source fragments: {payload['fragment_count']}", flush=True)
     elif kind == "file_start":
         print(f"[{payload['position']}/{payload['total']}] {payload['file']}", flush=True)
     elif kind == "rows":
@@ -3668,23 +4020,30 @@ def cli_progress(payload: dict) -> None:
     elif kind == "file_done":
         print(f"  done in {format_seconds(float(payload['seconds']))}", flush=True)
     elif kind == "write_start":
-        print("Writing workbook and charts…", flush=True)
-    elif kind == "legacy_write_start":
-        print("Writing legacy-compatible full workbook…", flush=True)
-    elif kind == "legacy_sheet_written":
-        print(
-            f"  legacy {payload['position']}/{payload['total']} {payload['sheet']}: {int(payload['rows']):,} rows",
-            flush=True,
-        )
+        print("Writing modern analysis workbook and charts…", flush=True)
+    elif kind == "delivery_write_start":
+        print("Writing five official historical-delivery workbooks…", flush=True)
+    elif kind == "delivery_file_done":
+        print(f"  delivery {payload['position']}/{payload['total']}: {payload['file']}", flush=True)
+    elif kind == "delivery_write_done":
+        print("  all five delivery workbooks promoted", flush=True)
     elif kind == "complete":
-        print(f"Complete in {format_seconds(float(payload['seconds']))}: {payload['file']}", flush=True)
+        print(f"Complete in {format_seconds(float(payload['seconds']))}", flush=True)
+        for path in payload.get("files", [payload["file"]]):
+            print(f"  {path}", flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=APP_TITLE)
     parser.add_argument("--input", type=Path, help="每日 D&TMOK <PORT> Excel 資料夾")
-    parser.add_argument("--output", type=Path, help="輸出 .xlsx")
-    parser.add_argument("--legacy-output", type=Path, help="同時輸出的原格式相容版 .xlsx")
+    parser.add_argument("--output", type=Path, help="Modern analysis 輸出 .xlsx")
+    parser.add_argument("--finalize-from", type=Path, help="讀取已覆核 Modern workbook 並重生五份正式成果")
+    parser.add_argument("--delivery-dir", type=Path, help="五份正式成果的輸出資料夾")
+    parser.add_argument(
+        "--legacy-output",
+        type=Path,
+        help="Deprecated：僅沿用其父資料夾作為 --delivery-dir，檔名會忽略",
+    )
     parser.add_argument("--port", help="可省略；來源含多港別時必須指定，例如 HWLN")
     parser.add_argument("--year", type=int, help="可省略；預設從固定格式檔名自動判定")
     parser.add_argument("--month", type=int, help="可省略；預設從固定格式檔名自動判定")
@@ -3697,14 +4056,62 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--workers",
         type=int,
         default=default_worker_count(),
-        help="同時處理的每日檔案數；預設依電腦自動使用 1–3",
+        help="同時處理的 logical day 數；預設依電腦自動使用 1–3",
     )
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--max-files", type=int, help="測試用：只處理前 N 檔")
+    parser.add_argument("--max-days", type=int, help="測試用：只處理前 N 個完整 logical days")
+    parser.add_argument("--max-files", type=int, help="Deprecated alias of --max-days")
+    parser.add_argument(
+        "--legacy-overflow",
+        choices=("error",),
+        default="error",
+        help="v1.5.0 固定為 error；明細超過 Excel 上限時不截斷",
+    )
     arguments = parser.parse_args(argv)
 
-    if all(value is None for value in (arguments.input, arguments.output, arguments.legacy_output, arguments.port, arguments.year, arguments.month)):
+    if all(
+        value is None
+        for value in (
+            arguments.input,
+            arguments.output,
+            arguments.finalize_from,
+            arguments.delivery_dir,
+            arguments.legacy_output,
+            arguments.port,
+            arguments.year,
+            arguments.month,
+            arguments.max_days,
+            arguments.max_files,
+        )
+    ):
         launch_gui()
+        return 0
+    if arguments.max_days is not None and arguments.max_files is not None:
+        parser.error("--max-days 與 deprecated --max-files 不可同時指定")
+    if arguments.finalize_from is not None:
+        if any(
+            value is not None
+            for value in (
+                arguments.input,
+                arguments.output,
+                arguments.legacy_output,
+                arguments.port,
+                arguments.year,
+                arguments.month,
+                arguments.max_days,
+                arguments.max_files,
+            )
+        ):
+            parser.error("--finalize-from 不可與來源分析參數並用")
+        paths = finalize_review_workbook(
+            arguments.finalize_from,
+            delivery_dir=arguments.delivery_dir,
+            overwrite=arguments.overwrite,
+            callback=cli_progress,
+        )
+        print("Finalized official delivery:", flush=True)
+        for path in paths.all_files():
+            print(f"  {path}", flush=True)
         return 0
     if arguments.input is None or arguments.output is None:
         parser.error("命令列模式必須同時指定 --input 與 --output；年份、月份可由檔名自動判定")
@@ -3717,14 +4124,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except ValueError as error:
         parser.error(str(error))
-    print(f"Filename job detected: {port} / {year}-{month:02d} ({count} daily files)", flush=True)
+    delivery_dir = arguments.delivery_dir
+    if arguments.legacy_output is not None:
+        legacy_parent = arguments.legacy_output.parent
+        if delivery_dir is not None and delivery_dir.resolve() != legacy_parent.resolve():
+            parser.error("--legacy-output 的父資料夾與 --delivery-dir 不一致")
+        delivery_dir = legacy_parent
+        print(
+            "Warning: --legacy-output 已淘汰；v1.5.0 將固定產生五份成果，並只沿用該路徑的父資料夾。",
+            file=sys.stderr,
+            flush=True,
+        )
+    print(f"Filename job detected: {port} / {year}-{month:02d} ({count} logical days)", flush=True)
     config = AppConfig(
         input_dir=arguments.input,
         output_path=arguments.output,
         port=port,
         year=year,
         month=month,
-        legacy_output_path=arguments.legacy_output,
+        delivery_dir=delivery_dir,
         max_distance=arguments.max_distance,
         tolerance=arguments.tolerance / 100.0,
         cluster_size=arguments.cluster_size,
@@ -3732,6 +4150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         message_types=parse_message_types(arguments.message_types),
         workers=arguments.workers,
         overwrite=arguments.overwrite,
+        max_days=arguments.max_days,
         max_files=arguments.max_files,
     )
     run_pipeline(config, callback=cli_progress)

@@ -15,10 +15,15 @@ from ais_monthly_app import (
     DIRECTION_ORDER,
     LEGACY_DIRECTION_ABBREVIATIONS,
     OPEN_SEA_INDEXES,
+    PERIOD_A,
+    PERIOD_B,
+    SourceFileError,
     SourceFragment,
+    _normalized_spool_path,
     build_processing_job,
     parse_source_filename,
     process_day_input,
+    read_normalized_spool,
     scan_source_files,
     select_cluster_from_sorted_rows,
 )
@@ -85,11 +90,27 @@ class SelectorBaselineTests(unittest.TestCase):
 class FragmentCatalogTests(unittest.TestCase):
     @staticmethod
     def _write_fragment(path: Path, distances: list[float]) -> None:
+        parsed = parse_source_filename(path.name)
+        if parsed is None:
+            raise AssertionError(path)
+        hour = 13 if parsed.suffix == "23" else 1
         workbook = openpyxl.Workbook(write_only=True)
         sheet = workbook.create_sheet("AIS")
-        sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
-        for distance in distances:
-            sheet.append([1, "East", 0.0, distance])
+        sheet.append(["Year", "Month", "Day", "Hour", "Minute", "Second", "channel", "msg_type", "mmsi", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+        for second, distance in enumerate(distances):
+            sheet.append([parsed.day.year, parsed.day.month, parsed.day.day, hour, 0, second, "A", 1, 400000000 + second, "East", 0.0, distance])
+        workbook.save(path)
+
+    @staticmethod
+    def _write_records(path: Path, records: list[tuple[int, int, str, int, float]]) -> None:
+        parsed = parse_source_filename(path.name)
+        if parsed is None:
+            raise AssertionError(path)
+        workbook = openpyxl.Workbook(write_only=True)
+        sheet = workbook.create_sheet("AIS")
+        sheet.append(["Year", "Month", "Day", "Hour", "Minute", "Second", "channel", "msg_type", "mmsi", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+        for hour, second, channel, msg_type, distance in records:
+            sheet.append([parsed.day.year, parsed.day.month, parsed.day.day, hour, 0, second, channel, msg_type, 500000000 + second, "East", 0.0, distance])
         workbook.save(path)
 
     def test_suffix_is_opaque_traceability_not_source_identity(self) -> None:
@@ -176,6 +197,118 @@ class FragmentCatalogTests(unittest.TestCase):
                 (second.selected, second.selected_rank, second.cluster_count),
                 (first.selected, first.selected_rank, first.cluster_count),
             )
+
+    def test_spool_is_profile_superset_includes_over_cap_and_preserves_provenance(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_any.xlsx"
+            self._write_records(
+                source,
+                [
+                    (1, 0, "A", 4, 100.0),
+                    (1, 1, "A", 4, 99.0),
+                    (1, 2, "B", 4, 98.0),
+                    (1, 3, "A", 1, 50.0),
+                    (1, 4, "A", 1, 49.0),
+                    (1, 5, "B", 1, 48.0),
+                    (13, 0, "A", 3, 70.0),
+                    (13, 1, "A", 3, 69.0),
+                    (13, 2, "B", 3, 68.0),
+                    (13, 3, "A", 2, 600.0),
+                    (13, 4, "B", 5, 900.0),
+                ],
+            )
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "ANY", source)
+            day_input = DayInput("KLNG", dt.date(2026, 6, 1), (fragment,))
+            config = AppConfig(
+                input_dir=folder,
+                output_path=folder / "modern.xlsx",
+                port="KLNG",
+                year=2026,
+                month=6,
+                message_types=(1,),
+            )
+            result = process_day_input(day_input, config)
+
+            self.assertEqual(result.directions["北"].selected, 50.0)
+            self.assertEqual(result.period_directions[PERIOD_A]["北"].selected, 100.0)
+            self.assertEqual(result.period_directions[PERIOD_B]["北"].selected, 70.0)
+            selected = result.period_directions[PERIOD_A]["北"].candidates[0]
+            self.assertTrue(selected.candidate_id)
+            self.assertEqual(selected.timestamp, dt.datetime(2026, 6, 1, 1, 0, 0))
+            self.assertEqual((selected.msg_type, selected.mmsi, selected.channel), (4, 500000000, "A"))
+            self.assertEqual((selected.fragment, selected.sheet, selected.source_row), (source.name, "AIS", 2))
+
+            counts, records = read_normalized_spool(_normalized_spool_path(config, result.day))
+            normalized = [record for _direction, record in records]
+            self.assertEqual(sum(counts), len(normalized))
+            self.assertEqual(len(normalized), 11)
+            self.assertEqual({record.msg_type for record in normalized}, {1, 2, 3, 4, 5})
+            self.assertEqual(max(record.distance for record in normalized), 900.0)
+
+            alternate = process_day_input(
+                day_input,
+                AppConfig(
+                    input_dir=folder,
+                    output_path=folder / "alternate.xlsx",
+                    port="KLNG",
+                    year=2026,
+                    month=6,
+                    message_types=(2,),
+                ),
+            )
+            self.assertNotEqual(
+                alternate.directions["北"].selected,
+                result.directions["北"].selected,
+            )
+            for period in (PERIOD_A, PERIOD_B):
+                self.assertEqual(
+                    alternate.period_directions[period]["北"].selected,
+                    result.period_directions[period]["北"].selected,
+                )
+
+    def test_byte_identical_fragment_alias_is_processed_once(self) -> None:
+        import shutil
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first = folder / "D&TMOK KLNG_20260601_copy-a.xlsx"
+            second = folder / "D&TMOK KLNG_20260601_copy-b.xlsx"
+            self._write_fragment(first, [10.0, 9.9, 9.8])
+            shutil.copyfile(first, second)
+            catalog, _warnings = scan_source_files(folder)
+            config = AppConfig(
+                input_dir=folder,
+                output_path=folder / "result.xlsx",
+                port="KLNG",
+                year=2026,
+                month=6,
+            )
+            result = process_day_input(catalog["KLNG"][dt.date(2026, 6, 1)], config)
+            self.assertEqual(result.rows_scanned, 3)
+            self.assertEqual(result.rows_normalized, 3)
+            self.assertEqual(len(result.fragment_info), 1)
+            self.assertEqual(result.fragment_info[0].aliases, (second,))
+            self.assertTrue(any("byte-identical" in item for item in result.diagnostics))
+
+    def test_official_day_processing_rejects_missing_time_schema(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            source = folder / "D&TMOK KLNG_20260601_bad.xlsx"
+            workbook = openpyxl.Workbook(write_only=True)
+            sheet = workbook.create_sheet("AIS")
+            sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+            sheet.append([1, "East", 0.0, 1.0])
+            workbook.save(source)
+            fragment = SourceFragment("KLNG", dt.date(2026, 6, 1), "BAD", source)
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+            with self.assertRaisesRegex(SourceFileError, "正式五檔輸出需要"):
+                process_day_input(DayInput("KLNG", fragment.day, (fragment,)), config)
 
 
 class ExternalJuneContractTests(unittest.TestCase):

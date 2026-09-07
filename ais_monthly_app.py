@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import concurrent.futures
+import hashlib
 import json
 import math
 import multiprocessing
@@ -29,12 +30,15 @@ import xlsxwriter
 
 APP_TITLE = "AIS 32方位月報一鍵製作"
 APP_VERSION = "1.4.0"
-CACHE_VERSION = 3
-LEGACY_SPOOL_VERSION = 2
+CACHE_VERSION = 4
+NORMALIZED_SPOOL_VERSION = 1
 EXCEL_MAX_DATA_ROWS = 1_048_575
-LEGACY_SPOOL_MAGIC = b"AISLEG3\0"
-LEGACY_RECORD = struct.Struct("<dd")
-LEGACY_COUNTS = struct.Struct("<32Q")
+NORMALIZED_SPOOL_MAGIC = b"AISNRM1\0"
+NORMALIZED_RECORD = struct.Struct("<ddQIIBq16s")
+NORMALIZED_COUNTS = struct.Struct("<32Q")
+HISTORICAL_MESSAGE_TYPES = (1, 3, 4, 18, 19)
+PERIOD_A = "period_a"
+PERIOD_B = "period_b"
 
 DIRECTION_ORDER = [
     "北", "北微東", "北北東", "東北微北", "東北", "東北微東", "東北東", "東微北", "東",
@@ -99,6 +103,41 @@ class Candidate:
     bearing: float
     source_row: int
     rank: int | None = None
+    candidate_id: str = ""
+    timestamp: datetime | None = None
+    mmsi: int | None = None
+    channel: str | None = None
+    fragment: str = ""
+    sheet: str = ""
+    msg_type: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedRecord:
+    distance: float
+    bearing: float
+    source_key: int
+    second_of_day: int
+    msg_type: int
+    mmsi: int | None
+    channel: str
+
+    @property
+    def period(self) -> str:
+        return PERIOD_A if self.second_of_day < 12 * 60 * 60 else PERIOD_B
+
+
+@dataclass(frozen=True)
+class FragmentInfo:
+    path: Path
+    suffix: str | None
+    sha256: str
+    sheet: str
+    rows_scanned: int
+    min_second: int | None
+    max_second: int | None
+    occupied_seconds: int
+    aliases: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -113,6 +152,7 @@ class DirectionResult:
     reason: str = "找不到符合條件的資料"
     over_cap_count: int = 0
     over_cap_max: float | None = None
+    selected_candidate_id: str | None = None
 
 
 @dataclass
@@ -120,12 +160,17 @@ class DayResult:
     day: date
     source_fragments: tuple[Path, ...]
     directions: dict[str, DirectionResult]
+    period_directions: dict[str, dict[str, DirectionResult]] = field(default_factory=dict)
+    fragment_info: tuple[FragmentInfo, ...] = ()
+    diagnostics: tuple[str, ...] = ()
     rows_scanned: int = 0
     rows_accepted: int = 0
     rows_invalid: int = 0
     rows_wrong_message: int = 0
     rows_not_east: int = 0
     rows_legacy: int = 0
+    rows_normalized: int = 0
+    spool_sha256: str = ""
     elapsed_seconds: float = 0.0
     note: str = ""
 
@@ -402,7 +447,15 @@ def _normalized_header(value: object) -> str:
 
 
 REQUIRED_HEADERS = {
+    "year": {"year"},
+    "month": {"month"},
+    "day": {"day"},
+    "hour": {"hour"},
+    "minute": {"minute"},
+    "second": {"second"},
+    "channel": {"channel"},
     "msg_type": {"msg_type", "msg type"},
+    "mmsi": {"mmsi"},
     "longitude_desc": {"longitude_desc", "longitude desc"},
     "bearing": {"bearing"},
     "distance": {"distance in nautical miles", "distance_in_nautical_miles"},
@@ -439,6 +492,41 @@ def locate_data_worksheet(workbook: object) -> tuple[object, dict[str, int]]:
             inspected.append(worksheet.title)
     names = "、".join(inspected) if inspected else "無工作表"
     raise ValueError(f"找不到包含必要欄位的工作表（已檢查：{names}）")
+
+
+def _required_integer(value: object, label: str, source_file: Path, excel_row: int) -> int:
+    number = _number(value)
+    if number is None or not number.is_integer():
+        raise SourceFileError(
+            f"來源檔「{source_file.name}」第 {excel_row:,} 列的 {label} 不是有效整數。"
+        )
+    return int(number)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(4 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _candidate_id(fragment: FragmentInfo, record: NormalizedRecord) -> str:
+    source_row = record.source_key & 0xFFFFFFFF
+    payload = "|".join(
+        (
+            fragment.sha256,
+            fragment.sheet,
+            str(source_row),
+            str(record.second_of_day),
+            str(record.msg_type),
+            "" if record.mmsi is None else str(record.mmsi),
+            record.channel,
+            format(record.bearing, ".17g"),
+            format(record.distance, ".17g"),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
 def select_cluster(
@@ -566,12 +654,86 @@ def select_cluster_from_sorted_rows(
     return result
 
 
+def select_cluster_from_normalized_records(
+    direction: str,
+    records: list[NormalizedRecord],
+    config: AppConfig,
+    fragment_info: Sequence[FragmentInfo],
+    parsed_day: date,
+) -> DirectionResult:
+    over_cap_count = 0
+    over_cap_max: float | None = None
+    for record in records:
+        if record.distance <= config.max_distance:
+            break
+        over_cap_count += 1
+        if over_cap_max is None:
+            over_cap_max = record.distance
+    raw_result = select_cluster_from_sorted_rows(
+        direction,
+        [(record.distance, record.source_key, record.bearing) for record in records],
+        config,
+        over_cap_count,
+        over_cap_max,
+    )
+    wanted_keys = {candidate.source_row for candidate in raw_result.candidates}
+    records_by_key = {
+        record.source_key: record for record in records if record.source_key in wanted_keys
+    }
+    enriched: list[Candidate] = []
+    for candidate in raw_result.candidates:
+        record = records_by_key[candidate.source_row]
+        fragment_index = record.source_key >> 32
+        source_row = record.source_key & 0xFFFFFFFF
+        fragment = fragment_info[fragment_index]
+        enriched.append(
+            Candidate(
+                distance=record.distance,
+                bearing=record.bearing,
+                source_row=source_row,
+                rank=candidate.rank,
+                candidate_id=_candidate_id(fragment, record),
+                timestamp=datetime.combine(parsed_day, datetime.min.time()).replace(
+                    hour=record.second_of_day // 3600,
+                    minute=(record.second_of_day % 3600) // 60,
+                    second=record.second_of_day % 60,
+                ),
+                mmsi=record.mmsi,
+                channel=record.channel,
+                fragment=fragment.path.name,
+                sheet=fragment.sheet,
+                msg_type=record.msg_type,
+            )
+        )
+    raw_result.candidates = enriched
+    if raw_result.selected_rank is not None:
+        selected_index = over_cap_count + raw_result.selected_rank - 1
+        if 0 <= selected_index < len(records):
+            selected_record = records[selected_index]
+            selected_fragment = fragment_info[selected_record.source_key >> 32]
+            raw_result.selected_candidate_id = _candidate_id(selected_fragment, selected_record)
+    return raw_result
+
+
 def empty_day_result(day: date, note: str = "當日來源檔缺漏") -> DayResult:
     directions = {
         name: DirectionResult(direction=name, status="無資料", reason=note)
         for name in DIRECTION_ORDER
     }
-    return DayResult(day=day, source_fragments=(), directions=directions, note=note)
+    period_directions = {
+        period: {
+            name: DirectionResult(direction=name, status="無資料", reason=note)
+            for name in DIRECTION_ORDER
+        }
+        for period in (PERIOD_A, PERIOD_B)
+    }
+    return DayResult(
+        day=day,
+        source_fragments=(),
+        directions=directions,
+        period_directions=period_directions,
+        note=note,
+    )
 
 
 def _job_storage_token(config: AppConfig) -> str:
@@ -582,13 +744,21 @@ def _cache_directory(config: AppConfig) -> Path:
     return config.output_path.parent / f".{config.output_path.stem}_{_job_storage_token(config)}_cache"
 
 
+def _normalized_spool_directory(config: AppConfig) -> Path:
+    return config.output_path.parent / f".{config.output_path.stem}_{_job_storage_token(config)}_rows"
+
+
 def _legacy_spool_directory(config: AppConfig) -> Path:
-    output = config.legacy_output_path or config.output_path
-    return output.parent / f".{output.stem}_{_job_storage_token(config)}_rows"
+    """Compatibility alias for the v1.5 normalized logical-day spool."""
+    return _normalized_spool_directory(config)
+
+
+def _normalized_spool_path(config: AppConfig, parsed_day: date) -> Path:
+    return _normalized_spool_directory(config) / f"{parsed_day:%Y%m%d}.bin"
 
 
 def _legacy_spool_path(config: AppConfig, parsed_day: date) -> Path:
-    return _legacy_spool_directory(config) / f"{parsed_day:%Y%m%d}.bin"
+    return _normalized_spool_path(config, parsed_day)
 
 
 def _cache_signature(day_input: DayInput, config: AppConfig) -> dict[str, object]:
@@ -612,38 +782,118 @@ def _cache_signature(day_input: DayInput, config: AppConfig) -> dict[str, object
         "cluster_size": config.cluster_size,
         "top_candidates": config.top_candidates,
         "message_types": list(config.message_types),
-        "legacy_spool_version": LEGACY_SPOOL_VERSION if config.legacy_output_path is not None else None,
+        "normalized_spool_version": NORMALIZED_SPOOL_VERSION,
     }
+
+
+def _direction_result_to_dict(result: DirectionResult) -> dict[str, object]:
+    return {
+        "selected": result.selected,
+        "selected_bearing": result.selected_bearing,
+        "selected_rank": result.selected_rank,
+        "selected_candidate_id": result.selected_candidate_id,
+        "cluster_count": result.cluster_count,
+        "status": result.status,
+        "reason": result.reason,
+        "over_cap_count": result.over_cap_count,
+        "over_cap_max": result.over_cap_max,
+        "candidates": [
+            {
+                "distance": item.distance,
+                "bearing": item.bearing,
+                "source_row": item.source_row,
+                "rank": item.rank,
+                "candidate_id": item.candidate_id,
+                "timestamp": item.timestamp.isoformat() if item.timestamp else None,
+                "mmsi": item.mmsi,
+                "channel": item.channel,
+                "fragment": item.fragment,
+                "sheet": item.sheet,
+                "msg_type": item.msg_type,
+            }
+            for item in result.candidates
+        ],
+    }
+
+
+def _direction_result_from_dict(direction: str, raw: object) -> DirectionResult:
+    if not isinstance(raw, dict):
+        raise ValueError("快取 direction 格式錯誤")
+    raw_candidates = raw.get("candidates", [])
+    candidates = [
+        Candidate(
+            distance=float(item["distance"]),
+            bearing=float(item["bearing"]),
+            source_row=int(item["source_row"]),
+            rank=int(item["rank"]) if item.get("rank") is not None else None,
+            candidate_id=str(item.get("candidate_id", "")),
+            timestamp=(
+                datetime.fromisoformat(str(item["timestamp"]))
+                if item.get("timestamp")
+                else None
+            ),
+            mmsi=int(item["mmsi"]) if item.get("mmsi") is not None else None,
+            channel=str(item["channel"]) if item.get("channel") is not None else None,
+            fragment=str(item.get("fragment", "")),
+            sheet=str(item.get("sheet", "")),
+            msg_type=int(item["msg_type"]) if item.get("msg_type") is not None else None,
+        )
+        for item in raw_candidates
+    ]
+    return DirectionResult(
+        direction=direction,
+        candidates=candidates,
+        selected=raw.get("selected"),
+        selected_bearing=raw.get("selected_bearing"),
+        selected_rank=raw.get("selected_rank"),
+        selected_candidate_id=raw.get("selected_candidate_id"),
+        cluster_count=int(raw.get("cluster_count", 0)),
+        status=str(raw.get("status", "無資料")),
+        reason=str(raw.get("reason", "")),
+        over_cap_count=int(raw.get("over_cap_count", 0)),
+        over_cap_max=raw.get("over_cap_max"),
+    )
 
 
 def _day_result_to_dict(day_result: DayResult) -> dict[str, object]:
     return {
         "day": day_result.day.isoformat(),
         "source_fragments": [str(path) for path in day_result.source_fragments],
+        "fragment_info": [
+            {
+                "path": str(info.path),
+                "suffix": info.suffix,
+                "sha256": info.sha256,
+                "sheet": info.sheet,
+                "rows_scanned": info.rows_scanned,
+                "min_second": info.min_second,
+                "max_second": info.max_second,
+                "occupied_seconds": info.occupied_seconds,
+                "aliases": [str(path) for path in info.aliases],
+            }
+            for info in day_result.fragment_info
+        ],
+        "diagnostics": list(day_result.diagnostics),
         "rows_scanned": day_result.rows_scanned,
         "rows_accepted": day_result.rows_accepted,
         "rows_invalid": day_result.rows_invalid,
         "rows_wrong_message": day_result.rows_wrong_message,
         "rows_not_east": day_result.rows_not_east,
         "rows_legacy": day_result.rows_legacy,
+        "rows_normalized": day_result.rows_normalized,
+        "spool_sha256": day_result.spool_sha256,
         "elapsed_seconds": day_result.elapsed_seconds,
         "note": day_result.note,
         "directions": {
-            direction: {
-                "selected": result.selected,
-                "selected_bearing": result.selected_bearing,
-                "selected_rank": result.selected_rank,
-                "cluster_count": result.cluster_count,
-                "status": result.status,
-                "reason": result.reason,
-                "over_cap_count": result.over_cap_count,
-                "over_cap_max": result.over_cap_max,
-                "candidates": [
-                    {"distance": item.distance, "bearing": item.bearing, "source_row": item.source_row, "rank": item.rank}
-                    for item in result.candidates
-                ],
-            }
+            direction: _direction_result_to_dict(result)
             for direction, result in day_result.directions.items()
+        },
+        "period_directions": {
+            period: {
+                direction: _direction_result_to_dict(result)
+                for direction, result in directions.items()
+            }
+            for period, directions in day_result.period_directions.items()
         },
     }
 
@@ -654,30 +904,18 @@ def _day_result_from_dict(payload: dict[str, object]) -> DayResult:
     if not isinstance(raw_directions, dict):
         raise ValueError("快取 directions 格式錯誤")
     for direction, raw in raw_directions.items():
-        if not isinstance(raw, dict):
-            raise ValueError("快取 direction 格式錯誤")
-        raw_candidates = raw.get("candidates", [])
-        candidates = [
-            Candidate(
-                distance=float(item["distance"]),
-                bearing=float(item["bearing"]),
-                source_row=int(item["source_row"]),
-                rank=int(item["rank"]) if item.get("rank") is not None else None,
-            )
-            for item in raw_candidates
-        ]
-        directions[str(direction)] = DirectionResult(
-            direction=str(direction),
-            candidates=candidates,
-            selected=raw.get("selected"),
-            selected_bearing=raw.get("selected_bearing"),
-            selected_rank=raw.get("selected_rank"),
-            cluster_count=int(raw.get("cluster_count", 0)),
-            status=str(raw.get("status", "無資料")),
-            reason=str(raw.get("reason", "")),
-            over_cap_count=int(raw.get("over_cap_count", 0)),
-            over_cap_max=raw.get("over_cap_max"),
-        )
+        directions[str(direction)] = _direction_result_from_dict(str(direction), raw)
+    period_directions: dict[str, dict[str, DirectionResult]] = {}
+    raw_periods = payload.get("period_directions", {})
+    if not isinstance(raw_periods, dict):
+        raise ValueError("快取 period_directions 格式錯誤")
+    for period, raw_period_directions in raw_periods.items():
+        if not isinstance(raw_period_directions, dict):
+            raise ValueError("快取 period direction 格式錯誤")
+        period_directions[str(period)] = {
+            str(direction): _direction_result_from_dict(str(direction), raw)
+            for direction, raw in raw_period_directions.items()
+        }
     source_values = payload.get("source_fragments")
     if source_values is None:
         source_value = payload.get("source_file")
@@ -688,12 +926,30 @@ def _day_result_from_dict(payload: dict[str, object]) -> DayResult:
         day=date.fromisoformat(str(payload["day"])),
         source_fragments=tuple(Path(str(value)) for value in source_values),
         directions=directions,
+        period_directions=period_directions,
+        fragment_info=tuple(
+            FragmentInfo(
+                path=Path(str(item["path"])),
+                suffix=str(item["suffix"]) if item.get("suffix") is not None else None,
+                sha256=str(item["sha256"]),
+                sheet=str(item["sheet"]),
+                rows_scanned=int(item["rows_scanned"]),
+                min_second=int(item["min_second"]) if item.get("min_second") is not None else None,
+                max_second=int(item["max_second"]) if item.get("max_second") is not None else None,
+                occupied_seconds=int(item["occupied_seconds"]),
+                aliases=tuple(Path(str(value)) for value in item.get("aliases", [])),
+            )
+            for item in payload.get("fragment_info", [])
+        ),
+        diagnostics=tuple(str(value) for value in payload.get("diagnostics", [])),
         rows_scanned=int(payload.get("rows_scanned", 0)),
         rows_accepted=int(payload.get("rows_accepted", 0)),
         rows_invalid=int(payload.get("rows_invalid", 0)),
         rows_wrong_message=int(payload.get("rows_wrong_message", 0)),
         rows_not_east=int(payload.get("rows_not_east", 0)),
         rows_legacy=int(payload.get("rows_legacy", payload.get("rows_accepted", 0))),
+        rows_normalized=int(payload.get("rows_normalized", payload.get("rows_legacy", 0))),
+        spool_sha256=str(payload.get("spool_sha256", "")),
         elapsed_seconds=float(payload.get("elapsed_seconds", 0.0)),
         note=str(payload.get("note", "")),
     )
@@ -708,10 +964,11 @@ def load_cached_day(day_input: DayInput, config: AppConfig) -> DayResult | None:
         if payload.get("signature") != _cache_signature(day_input, config):
             return None
         result = _day_result_from_dict(payload["result"])
-        if config.legacy_output_path is not None:
-            spool_path = _legacy_spool_path(config, day_input.day)
-            if not spool_path.is_file() or sum(legacy_spool_counts(spool_path)) != result.rows_legacy:
-                return None
+        spool_path = _normalized_spool_path(config, day_input.day)
+        if not spool_path.is_file() or sum(normalized_spool_counts(spool_path)) != result.rows_normalized:
+            return None
+        if result.spool_sha256 and _file_sha256(spool_path) != result.spool_sha256:
+            return None
         return result
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
@@ -730,62 +987,99 @@ def save_cached_day(day_input: DayInput, config: AppConfig, day_result: DayResul
     os.replace(temp_path, cache_path)
 
 
-def write_legacy_spool(
+def write_normalized_spool(
     config: AppConfig,
     parsed_day: date,
-    rows: list[list[tuple[float, int, float]]],
-    *,
-    presorted: bool = False,
-) -> Path:
-    spool_dir = _legacy_spool_directory(config)
+    rows: list[list[NormalizedRecord]],
+) -> tuple[Path, str]:
+    spool_dir = _normalized_spool_directory(config)
     spool_dir.mkdir(parents=True, exist_ok=True)
-    target = _legacy_spool_path(config, parsed_day)
+    target = _normalized_spool_path(config, parsed_day)
     temporary = target.with_suffix(".tmp")
     counts = [len(bucket) for bucket in rows]
     with temporary.open("wb") as handle:
-        handle.write(LEGACY_SPOOL_MAGIC)
-        handle.write(LEGACY_COUNTS.pack(*counts))
+        handle.write(NORMALIZED_SPOOL_MAGIC)
+        handle.write(NORMALIZED_COUNTS.pack(*counts))
         for bucket in rows:
-            if not presorted:
-                bucket.sort(key=lambda item: (-item[0], item[1]))
-            for distance, _source_row, bearing in bucket:
-                handle.write(LEGACY_RECORD.pack(distance, bearing))
-            bucket.clear()
+            for record in bucket:
+                encoded_channel = record.channel.encode("utf-8")
+                if len(encoded_channel) > 16:
+                    raise SourceFileError(
+                        f"channel 值過長，無法寫入 normalized spool：{record.channel!r}"
+                    )
+                handle.write(
+                    NORMALIZED_RECORD.pack(
+                        record.distance,
+                        record.bearing,
+                        record.source_key,
+                        record.second_of_day,
+                        record.msg_type,
+                        0 if record.period == PERIOD_A else 1,
+                        -1 if record.mmsi is None else record.mmsi,
+                        encoded_channel.ljust(16, b"\0"),
+                    )
+                )
+        handle.flush()
+        os.fsync(handle.fileno())
+    digest = _file_sha256(temporary)
     os.replace(temporary, target)
-    return target
+    return target, digest
 
 
-def legacy_spool_counts(path: Path) -> list[int]:
+def normalized_spool_counts(path: Path) -> list[int]:
     with path.open("rb") as handle:
-        if handle.read(len(LEGACY_SPOOL_MAGIC)) != LEGACY_SPOOL_MAGIC:
-            raise ValueError(f"舊格式暫存檔格式錯誤：{path.name}")
-        counts_raw = handle.read(LEGACY_COUNTS.size)
-        if len(counts_raw) != LEGACY_COUNTS.size:
-            raise ValueError(f"舊格式暫存檔不完整：{path.name}")
-        counts = list(LEGACY_COUNTS.unpack(counts_raw))
-    expected_size = len(LEGACY_SPOOL_MAGIC) + LEGACY_COUNTS.size + sum(counts) * LEGACY_RECORD.size
+        if handle.read(len(NORMALIZED_SPOOL_MAGIC)) != NORMALIZED_SPOOL_MAGIC:
+            raise ValueError(f"normalized spool 格式錯誤：{path.name}")
+        counts_raw = handle.read(NORMALIZED_COUNTS.size)
+        if len(counts_raw) != NORMALIZED_COUNTS.size:
+            raise ValueError(f"normalized spool 不完整：{path.name}")
+        counts = list(NORMALIZED_COUNTS.unpack(counts_raw))
+    expected_size = (
+        len(NORMALIZED_SPOOL_MAGIC)
+        + NORMALIZED_COUNTS.size
+        + sum(counts) * NORMALIZED_RECORD.size
+    )
     if path.stat().st_size != expected_size:
-        raise ValueError(f"舊格式暫存檔大小不符：{path.name}")
+        raise ValueError(f"normalized spool 大小不符：{path.name}")
     return counts
 
 
-def read_legacy_spool(path: Path) -> tuple[list[int], Iterable[tuple[int, float, float]]]:
+def read_normalized_spool(
+    path: Path,
+) -> tuple[list[int], Iterable[tuple[int, NormalizedRecord]]]:
     handle = path.open("rb")
     try:
-        counts = legacy_spool_counts(path)
-        handle.seek(len(LEGACY_SPOOL_MAGIC) + LEGACY_COUNTS.size)
+        counts = normalized_spool_counts(path)
+        handle.seek(len(NORMALIZED_SPOOL_MAGIC) + NORMALIZED_COUNTS.size)
 
-        def records() -> Iterable[tuple[int, float, float]]:
+        def records() -> Iterable[tuple[int, NormalizedRecord]]:
             try:
                 for direction_index, count in enumerate(counts):
                     for _ in range(count):
-                        raw = handle.read(LEGACY_RECORD.size)
-                        if len(raw) != LEGACY_RECORD.size:
-                            raise ValueError(f"舊格式暫存檔資料中斷：{path.name}")
-                        distance, bearing = LEGACY_RECORD.unpack(raw)
-                        yield direction_index, distance, bearing
+                        raw = handle.read(NORMALIZED_RECORD.size)
+                        if len(raw) != NORMALIZED_RECORD.size:
+                            raise ValueError(f"normalized spool 資料中斷：{path.name}")
+                        (
+                            distance,
+                            bearing,
+                            source_key,
+                            second_of_day,
+                            msg_type,
+                            _period_code,
+                            mmsi,
+                            raw_channel,
+                        ) = NORMALIZED_RECORD.unpack(raw)
+                        yield direction_index, NormalizedRecord(
+                            distance=distance,
+                            bearing=bearing,
+                            source_key=source_key,
+                            second_of_day=second_of_day,
+                            msg_type=msg_type,
+                            mmsi=None if mmsi < 0 else mmsi,
+                            channel=raw_channel.rstrip(b"\0").decode("utf-8"),
+                        )
                 if handle.read(1):
-                    raise ValueError(f"舊格式暫存檔尾端有非預期資料：{path.name}")
+                    raise ValueError(f"normalized spool 尾端有非預期資料：{path.name}")
             finally:
                 handle.close()
 
@@ -793,6 +1087,20 @@ def read_legacy_spool(path: Path) -> tuple[list[int], Iterable[tuple[int, float,
     except Exception:
         handle.close()
         raise
+
+
+def legacy_spool_counts(path: Path) -> list[int]:
+    return normalized_spool_counts(path)
+
+
+def read_legacy_spool(path: Path) -> tuple[list[int], Iterable[tuple[int, float, float]]]:
+    counts, normalized_records = read_normalized_spool(path)
+
+    def records() -> Iterable[tuple[int, float, float]]:
+        for direction_index, record in normalized_records:
+            yield direction_index, record.distance, record.bearing
+
+    return counts, records()
 
 
 def _process_day_worker(arguments: tuple[DayInput, AppConfig]) -> tuple[date, DayResult]:
@@ -832,16 +1140,34 @@ def process_day_input(
 ) -> DayResult:
     parsed_day = day_input.day
     started = time.perf_counter()
-    all_rows: list[list[tuple[float, int, float]]] = [[] for _ in DIRECTION_ORDER]
-    over_cap_counts = [0] * len(DIRECTION_ORDER)
-    over_cap_maxes: list[float | None] = [None] * len(DIRECTION_ORDER)
+    all_rows: list[list[NormalizedRecord]] = [[] for _ in DIRECTION_ORDER]
     result = DayResult(
         day=parsed_day,
         source_fragments=tuple(fragment.path for fragment in day_input.fragments),
         directions={},
     )
 
-    for fragment_index, fragment in enumerate(day_input.fragments):
+    hashed_fragments = [(fragment, _file_sha256(fragment.path)) for fragment in day_input.fragments]
+    by_digest: dict[str, list[SourceFragment]] = {}
+    for fragment, digest in hashed_fragments:
+        by_digest.setdefault(digest, []).append(fragment)
+    canonical_fragments = [
+        (digest, sorted(fragments, key=lambda item: item.path.name.casefold()))
+        for digest, fragments in by_digest.items()
+    ]
+    canonical_fragments.sort(key=lambda item: item[0])
+    fragment_info: list[FragmentInfo] = []
+    occupied_by_fragment: list[bytearray] = []
+    diagnostics: list[str] = []
+
+    for fragment_index, (fragment_digest, equivalent_fragments) in enumerate(canonical_fragments):
+        fragment = equivalent_fragments[0]
+        aliases = tuple(item.path for item in equivalent_fragments[1:])
+        if aliases:
+            diagnostics.append(
+                f"byte-identical duplicate file：{fragment.path.name} 代表 "
+                + "、".join(path.name for path in aliases)
+            )
         source_file = fragment.path
         try:
             workbook = openpyxl.load_workbook(source_file, read_only=True, data_only=True)
@@ -854,23 +1180,55 @@ def process_day_input(
                 worksheet, indexes = locate_data_worksheet(workbook)
             except ValueError as error:
                 raise SourceFileError(
-                    f"來源檔「{source_file.name}」{error}。需要 msg_type、LONGITUDE_DESC、bearing、distance in nautical miles。"
+                    f"來源檔「{source_file.name}」{error}。正式五檔輸出需要日期、時間、channel、"
+                    "msg_type、mmsi、LONGITUDE_DESC、bearing、distance in nautical miles。"
                 ) from error
             max_index = max(indexes.values())
             estimated_rows = max((worksheet.max_row or 1) - 1, 1)
+            fragment_rows = 0
+            min_second: int | None = None
+            max_second: int | None = None
+            occupied = bytearray(24 * 60 * 60)
 
             for excel_row, row in enumerate(worksheet.iter_rows(min_row=2, values_only=True), start=2):
                 result.rows_scanned += 1
+                fragment_rows += 1
                 if cancel_event and excel_row % 10000 == 0 and cancel_event.is_set():
                     raise CancelledError("使用者已取消")
                 if len(row) <= max_index:
-                    result.rows_invalid += 1
-                    continue
+                    raise SourceFileError(
+                        f"來源檔「{source_file.name}」第 {excel_row:,} 列欄位不足，無法建立正式交付 provenance。"
+                    )
+
+                year = _required_integer(row[indexes["year"]], "Year", source_file, excel_row)
+                month = _required_integer(row[indexes["month"]], "Month", source_file, excel_row)
+                day_number = _required_integer(row[indexes["day"]], "Day", source_file, excel_row)
+                hour = _required_integer(row[indexes["hour"]], "Hour", source_file, excel_row)
+                minute = _required_integer(row[indexes["minute"]], "Minute", source_file, excel_row)
+                second = _required_integer(row[indexes["second"]], "Second", source_file, excel_row)
+                try:
+                    row_day = date(year, month, day_number)
+                    datetime(year, month, day_number, hour, minute, second)
+                except ValueError as error:
+                    raise SourceFileError(
+                        f"來源檔「{source_file.name}」第 {excel_row:,} 列日期／時間無效：{error}"
+                    ) from error
+                if row_day != parsed_day:
+                    raise SourceFileError(
+                        f"來源檔「{source_file.name}」第 {excel_row:,} 列日期為 {row_day}，"
+                        f"不符合檔名 logical day {parsed_day}。"
+                    )
+                second_of_day = hour * 3600 + minute * 60 + second
+                occupied[second_of_day] = 1
+                min_second = second_of_day if min_second is None else min(min_second, second_of_day)
+                max_second = second_of_day if max_second is None else max(max_second, second_of_day)
 
                 msg_type = _message_type(row[indexes["msg_type"]])
+                if msg_type is None or not 0 <= msg_type <= 0xFFFFFFFF:
+                    result.rows_invalid += 1
+                    continue
                 if msg_type not in config.message_types:
                     result.rows_wrong_message += 1
-                    continue
                 longitude_desc = row[indexes["longitude_desc"]]
                 if str(longitude_desc).strip().casefold() != "east":
                     result.rows_not_east += 1
@@ -884,22 +1242,24 @@ def process_day_input(
 
                 direction_index, normalized_bearing = direction_info
                 source_key = (fragment_index << 32) | excel_row
-                all_rows[direction_index].append((distance, source_key, normalized_bearing))
-                if config.legacy_output_path is not None:
+                raw_mmsi = _number(row[indexes["mmsi"]])
+                mmsi = int(raw_mmsi) if raw_mmsi is not None and raw_mmsi.is_integer() else None
+                channel = "" if row[indexes["channel"]] is None else str(row[indexes["channel"]]).strip()
+                record = NormalizedRecord(
+                    distance=distance,
+                    bearing=normalized_bearing,
+                    source_key=source_key,
+                    second_of_day=second_of_day,
+                    msg_type=msg_type,
+                    mmsi=mmsi,
+                    channel=channel,
+                )
+                all_rows[direction_index].append(record)
+                result.rows_normalized += 1
+                if msg_type in HISTORICAL_MESSAGE_TYPES:
                     result.rows_legacy += 1
-                    if result.rows_legacy > EXCEL_MAX_DATA_ROWS:
-                        raise SourceFileError(
-                            f"{parsed_day:%Y-%m-%d} 合併後符合舊格式的資料超過 Excel 單張工作表上限 "
-                            f"{EXCEL_MAX_DATA_ROWS:,} 列。"
-                        )
-                if distance > config.max_distance:
-                    over_cap_counts[direction_index] += 1
-                    prior_max = over_cap_maxes[direction_index]
-                    if prior_max is None or distance > prior_max:
-                        over_cap_maxes[direction_index] = distance
-                    continue
-
-                result.rows_accepted += 1
+                if msg_type in config.message_types and distance <= config.max_distance:
+                    result.rows_accepted += 1
 
                 if excel_row % 100000 == 0:
                     emit(
@@ -909,20 +1269,74 @@ def process_day_input(
                         rows=result.rows_scanned,
                         estimated_rows=estimated_rows,
                     )
+            fragment_info.append(
+                FragmentInfo(
+                    path=source_file,
+                    suffix=fragment.suffix,
+                    sha256=fragment_digest,
+                    sheet=worksheet.title,
+                    rows_scanned=fragment_rows,
+                    min_second=min_second,
+                    max_second=max_second,
+                    occupied_seconds=sum(occupied),
+                    aliases=aliases,
+                )
+            )
+            occupied_by_fragment.append(occupied)
         finally:
             workbook.close()
 
+    for first_index, first in enumerate(fragment_info):
+        for second_index in range(first_index + 1, len(fragment_info)):
+            second = fragment_info[second_index]
+            if (
+                first.min_second is not None
+                and first.max_second is not None
+                and second.min_second is not None
+                and second.max_second is not None
+                and max(first.min_second, second.min_second) <= min(first.max_second, second.max_second)
+            ):
+                diagnostics.append(
+                    f"time-range overlap：{first.path.name} / {second.path.name}"
+                )
+            occupied_overlap = sum(
+                1
+                for left, right in zip(
+                    occupied_by_fragment[first_index], occupied_by_fragment[second_index]
+                )
+                if left and right
+            )
+            if occupied_overlap:
+                diagnostics.append(
+                    f"occupied-second overlap：{first.path.name} / {second.path.name} "
+                    f"共 {occupied_overlap:,} 秒；未做 timestamp dedupe"
+                )
+
+    result.fragment_info = tuple(fragment_info)
+    result.diagnostics = tuple(diagnostics)
     for index, direction in enumerate(DIRECTION_ORDER):
-        all_rows[index].sort(key=lambda item: (-item[0], item[1]))
-        result.directions[direction] = select_cluster_from_sorted_rows(
-            direction=direction,
-            rows=all_rows[index],
-            config=config,
-            over_cap_count=over_cap_counts[index],
-            over_cap_max=over_cap_maxes[index],
+        all_rows[index].sort(key=lambda item: (-item.distance, item.source_key))
+        logical_records = [
+            record for record in all_rows[index] if record.msg_type in config.message_types
+        ]
+        result.directions[direction] = select_cluster_from_normalized_records(
+            direction, logical_records, config, result.fragment_info, parsed_day
         )
-    if config.legacy_output_path is not None:
-        write_legacy_spool(config, parsed_day, all_rows, presorted=True)
+    result.period_directions = {}
+    for period in (PERIOD_A, PERIOD_B):
+        period_results: dict[str, DirectionResult] = {}
+        for index, direction in enumerate(DIRECTION_ORDER):
+            period_records = [
+                record
+                for record in all_rows[index]
+                if record.msg_type in HISTORICAL_MESSAGE_TYPES and record.period == period
+            ]
+            period_results[direction] = select_cluster_from_normalized_records(
+                direction, period_records, config, result.fragment_info, parsed_day
+            )
+        result.period_directions[period] = period_results
+
+    _spool_path, result.spool_sha256 = write_normalized_spool(config, parsed_day, all_rows)
 
     result.elapsed_seconds = time.perf_counter() - started
     return result
@@ -1599,10 +2013,10 @@ def write_legacy_workbook(
                         f"缺少 {day_result.day:%Y-%m-%d} 的原格式資料暫存檔；請重新執行該月份。"
                     )
                 counts, records = read_legacy_spool(spool_path)
-                if sum(counts) != day_result.rows_legacy:
+                if sum(counts) != day_result.rows_normalized:
                     raise ValueError(
                         f"{day_result.day:%Y-%m-%d} 原格式資料筆數不一致："
-                        f"暫存 {sum(counts):,} / 紀錄 {day_result.rows_legacy:,}。"
+                        f"暫存 {sum(counts):,} / 紀錄 {day_result.rows_normalized:,}。"
                     )
                 excel_row = 1
                 for direction_index, distance, bearing in records:
@@ -1618,7 +2032,7 @@ def write_legacy_workbook(
                 position=position,
                 total=len(day_results),
                 sheet=sheet_name,
-                rows=day_result.rows_legacy,
+                rows=day_result.rows_normalized,
             )
 
         summary = workbook.add_worksheet("總表")

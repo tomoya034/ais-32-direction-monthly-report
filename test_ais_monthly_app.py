@@ -127,10 +127,10 @@ class RuleTests(unittest.TestCase):
             cover.title = "說明"
             cover.append(["這不是 AIS 資料表"])
             sheet = workbook.create_sheet("AIS")
-            sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
-            sheet.append([1, "East", 0.0, 80.0])
-            sheet.append([2, "East", 0.0, 79.0])
-            sheet.append([3, "East", 0.0, 78.0])
+            sheet.append(["Year", "Month", "Day", "Hour", "Minute", "Second", "channel", "msg_type", "mmsi", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+            sheet.append([2026, 4, 1, 12, 0, 0, "A", 1, 100000001, "East", 0.0, 80.0])
+            sheet.append([2026, 4, 1, 12, 0, 1, "A", 2, 100000002, "East", 0.0, 79.0])
+            sheet.append([2026, 4, 1, 12, 0, 2, "B", 3, 100000003, "East", 0.0, 78.0])
             workbook.save(source)
 
             result = process_source_file(
@@ -155,7 +155,7 @@ class EndToEndTests(unittest.TestCase):
             source = folder / "D&TMOK KLNG_20260401_23.xlsx"
             workbook = openpyxl.Workbook(write_only=True)
             sheet = workbook.create_sheet("AIS")
-            sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles", "unused"])
+            sheet.append(["Year", "Month", "Day", "Hour", "Minute", "Second", "channel", "msg_type", "mmsi", "LONGITUDE_DESC", "bearing", "distance in nautical miles", "unused"])
             rows = [
                 (1, "East", 0.0, 100.0),
                 (3, "East", 0.0, 80.0),
@@ -168,10 +168,18 @@ class EndToEndTests(unittest.TestCase):
                 (1, "West", 0.0, 499.0),
                 (1, "East", 0.0, 600.0),
             ]
-            for row in rows:
-                sheet.append([*row, "x"])
+            for second, row in enumerate(rows):
+                msg_type, longitude_desc, bearing, distance = row
+                sheet.append([2026, 4, 1, 13, 0, second, "A", msg_type, 200000000 + second, longitude_desc, bearing, distance, "x"])
             workbook.save(source)
-            shutil.copyfile(source, folder / "D&TMOK KLNG_20260402_23.xlsx")
+            second_source = folder / "D&TMOK KLNG_20260402_23.xlsx"
+            workbook = openpyxl.Workbook(write_only=True)
+            sheet = workbook.create_sheet("AIS")
+            sheet.append(["Year", "Month", "Day", "Hour", "Minute", "Second", "channel", "msg_type", "mmsi", "LONGITUDE_DESC", "bearing", "distance in nautical miles", "unused"])
+            for second, row in enumerate(rows):
+                msg_type, longitude_desc, bearing, distance = row
+                sheet.append([2026, 4, 2, 13, 0, second, "A", msg_type, 200000000 + second, longitude_desc, bearing, distance, "x"])
+            workbook.save(second_source)
 
             output = folder / "result.xlsx"
             legacy_output = folder / "result_legacy.xlsx"
@@ -228,12 +236,14 @@ class EndToEndTests(unittest.TestCase):
 class MultiPortTests(unittest.TestCase):
     @staticmethod
     def _write_sample(path: Path) -> None:
+        parsed = parse_source_filename(path.name)
+        if parsed is None:
+            raise AssertionError(path)
         workbook = openpyxl.Workbook(write_only=True)
         sheet = workbook.create_sheet("AIS")
-        sheet.append(["msg_type", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
-        sheet.append([1, "East", 0.0, 80.0])
-        sheet.append([2, "East", 0.0, 79.0])
-        sheet.append([3, "East", 0.0, 78.0])
+        sheet.append(["Year", "Month", "Day", "Hour", "Minute", "Second", "channel", "msg_type", "mmsi", "LONGITUDE_DESC", "bearing", "distance in nautical miles"])
+        for second, (msg_type, distance) in enumerate(((1, 80.0), (2, 79.0), (3, 78.0))):
+            sheet.append([parsed.day.year, parsed.day.month, parsed.day.day, 13, 0, second, "A", msg_type, 300000000 + second, "East", 0.0, distance])
         workbook.save(path)
 
     def test_klng_filename_parses_port_and_date(self) -> None:

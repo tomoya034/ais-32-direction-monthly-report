@@ -1,32 +1,63 @@
-AIS 32 方位月報一鍵製作 v1.4.0
+AIS 32 方位月報一鍵製作 v1.5.0
 =================================
 
+【第一次分析】
 1. 雙擊 AIS_32方位月報工具.exe；不需要 Python、Token 或 API Key。
-2. 選擇含 D&TMOK <PORT>_YYYYMMDD_*.xlsx 的 AIS 資料夾。
-3. 程式會從檔名判定港別與月份；多港資料夾請選港別，多月份時可從清單選月份。
-4. 保持勾選「同時產生原格式相容版」。
-5. 按「開始全自動製作」。
-6. 完成後先查看新版工作簿的「待複核」工作表。
+2. 選擇含 D&TMOK <PORT>_YYYYMMDD_*.xlsx 的原始月份資料夾。
+3. 程式會由檔名判定港別與年月；多港／多月份時請從清單選擇。
+4. 確認 Modern 分析輸出位置。五份正式成果會固定建立在畫面顯示的資料夾。
+5. 按「開始全自動製作」。完成後共有一份 Modern 分析及五份正式成果。
 
-輸出檔
-- *_新版自動分析.xlsx
-- *_原格式相容版.xlsx
+同港同日的所有檔案會合併成一個 logical day。_11、_23 或其他檔名尾碼只供追溯，
+不代表固定資料來源，也不會只保留其中一份。
 
-預設規則
-- AIS 訊息類型：1、2、3、18、19。
+【人工覆核與最終化】
+1. 開啟 Modern workbook 的「決策台帳」。
+2. logical_day 可填同 scope 的 Candidate ID、留白，或 forced numeric override。
+3. period_a / period_b 只能填同日、同 period、同方位的真實 Candidate ID 或留白；
+   不允許自行輸入數值。
+4. 儲存並關閉 workbook。
+5. 回到工具，按「讀取已覆核分析並重生五份成果」，選擇剛儲存的檔案。
+6. 程式驗證來源與決策後，會由同一 decision snapshot 重新建立全部五份。
+
+請勿人工各自修改五份正式成果；下次 finalization 會以 Modern decision ledger 為準。
+
+【輸出】
+Modern：
+- <PORT>_YYYY年MM月_32方位數值_新版自動分析.xlsx
+
+正式交付\<PORT>_YYYYMM\：
+- <PORT> M月 32方位數值_2.xlsx                 Period A 大 workbook
+- <PORT> M月 32方位數值.xlsx                   Period B 大 workbook
+- <PORT> M月 32方位數值_2 總表.xlsx            Period A 小總表
+- <PORT> M月 32方位數值 總表.xlsx              Period B 小總表
+- <PORT>_M月_32方位_每日較大值整合總表.xlsx     Period A/B 整合總表
+
+Period 依每列實際時間定義，與檔名尾碼無關：
+- Period A：00:00:00 <= time < 12:00:00
+- Period B：12:00:00 <= time < 24:00:00
+
+五檔固定契約：
+- Period detail MAX = Period final（21 海向）
+- Period 小總表 = 對應大 workbook 總表
+- Integrated = MAX(Period A final, Period B final)
+- 統計與圖表每次由當下 grid 重算
+
+【兩套 profile】
+- Modern research 預設訊息類型：1、2、3、18、19；可調整，只影響 logical-day 分析。
+- Historical delivery 固定訊息類型：1、3、4、18、19；不受 Modern 設定影響。
 - LONGITUDE_DESC = East。
-- 距離上限 500 NM。
-- 由高至低尋找至少 3 筆、落在 10% 範圍內的第一個群聚。
-- 西南西、西微南、西超過 10 NM 時列入待複核。
+- 預設 selection 距離上限 500 NM。
+- 由高至低找第一個至少 3 筆、落在 10% 範圍內的群聚。
+- top candidates 只控制畫面／workbook 顯示筆數，不會縮短 selector 搜尋。
 
-注意
-- 影片中的逐日篩選、異常高值排除、刪列、複製公式、排序與彙總已改由程式一次完成。
-- 同一資料夾若有多個月份，只能從檔名產生的唯讀清單選擇，不會手動輸入錯月份。
-- 同一份月報只處理一個港別；切換港別時月份清單會同步更新。
-- KLNG、HWLN 為目前已驗證範例；其他相同資料結構且符合檔名格式的港別也可自動辨識。
-- 建議平行檔案數先用 2–3；資源不足時改成 1。
-- 中途停止後以相同設定重跑，可接續已完成日期。
-- 原始每日 Excel 只讀取、不修改。
-- 若來源活頁簿第一頁是封面，程式會自動尋找含必要欄位的 AIS 資料分頁。
-- 可攜版預設將結果放在程式旁的 output\AIS月報。
-- 請勿把真實 AIS 資料或產生的工作簿上傳到公開 Issue。
+【異常與安全】
+- 相同 timestamp 可能是正常不同 AIS 訊息，不會只因同秒就去重。
+- 整檔 SHA-256 完全相同時只處理一次；其他重疊只診斷，不 silent dedupe。
+- 損壞檔案、缺少必要欄位、列內日期與檔名不同會停止正式輸出。
+- Excel 每張明細最多 1,048,575 筆；超限會停止，絕不截斷。
+- 五份成果全部成功建立後才整組替換；失敗時保留原本五檔。
+- 中途停止後以相同來源重跑，可沿用已驗證的每日 cache / spool。
+- 原始 Excel 一律只讀取、不修改；真實 AIS、Golden、cache、spool 與輸出不可提交 Git。
+
+可攜版預設將結果放在程式旁的 output\AIS月報。

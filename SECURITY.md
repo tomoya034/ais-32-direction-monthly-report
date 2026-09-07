@@ -2,7 +2,7 @@
 
 ## Supported version
 
-目前支援 `0.0.x` 測試版本。
+目前支援 `1.5.x`。舊版未修正同日多 fragment 遺失與五檔一致性問題，不建議繼續用於正式月份成果。
 
 ## Reporting
 

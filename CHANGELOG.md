@@ -2,6 +2,40 @@
 
 所有重要變更均記錄於此。
 
+## [1.5.0] - 2026-09-07
+
+### Added
+
+- 同港同日支援任意數量來源 fragments；檔名 suffix 改為純追溯資訊，不再以 mtime 選一檔而遺失同日資料。
+- 加入 profile-neutral logical-day normalized spool，保存 msg_type、時間、MMSI、channel、fragment、sheet、source row 及超過 selection cap 的有效 East rows。
+- Modern workbook 新增 `logical_day`、`period_a`、`period_b` 候選與唯一 decision ledger；Period A/B 僅接受真實 Candidate ID 或留白。
+- 首次分析預設產生 Modern workbook 與五份正式 Historical delivery；覆核後可從 GUI 或 `--finalize-from` 驗證並整組重生五檔。
+- 加入 time-range、occupied-second、正常同秒訊息、possible duplicate event、normalized-core 相同紀錄及 byte-identical file 的分層診斷。
+- 加入六月外部 Golden contract gate、代表日 full-search checksum regression、五檔公式／圖表／數值契約與故障復原測試。
+
+### Changed
+
+- Modern logical-day 固定先 union 當日全部 fragments 再選值；Historical delivery 依 row timestamp 切成 Period A（00:00–11:59:59）與 Period B（12:00–23:59:59）。
+- `top_candidates` 只影響 workbook 顯示，selector 一律完整搜尋；輸出 renderer 不再改變研究值。
+- Modern 預設 profile 保持 `{1,2,3,18,19}`，Historical delivery 固定 `{1,3,4,18,19}`，兩者設定與語意互相隔離。
+- 五份成果均由同一 decision snapshot 建立；統計與圖表由本次 grid 重算，整合表嚴格使用 `MAX(Period A, Period B)`。
+- 每日 worker 改以 logical day 計數；CLI 新增 `--max-days` 與 `--delivery-dir`，`--max-files`、`--legacy-output` 僅作 deprecated alias。
+- 經六月 6/1、6/5、6/20 benchmark 後採 simple per-day compact in-memory sorting；external runs 延後到實際單日資料超出目前約 288 MiB peak RSS 基準時再評估。
+
+### Fixed
+
+- 修正 v1.4.0 對同港同日多檔只保留 mtime winner，造成六月 `_11` 30 份資料全部未處理的問題。
+- 修正 modern-only 只搜尋顯示候選、啟用舊格式才完整搜尋所造成的輸出選項影響研究值。
+- 正式五檔改為先完整建立再整組替換；失敗會復原舊 snapshot，不留下新舊混用成果。
+- Excel 明細超過 1,048,575 筆時於發布前停止，絕不靜默截斷。
+
+### Contract
+
+- `Period detail MAX = Period final`。
+- `Period 小總表 = 對應大 workbook 總表`。
+- `Integrated = MAX(Period A final, Period B final)`。
+- 非 byte-identical fragments 在沒有領域 dedupe key 前只診斷、不自動去重。
+
 ## [1.4.0] - 2026-09-03
 
 ### Added

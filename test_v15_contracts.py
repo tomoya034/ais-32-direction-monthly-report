@@ -11,6 +11,7 @@ from unittest import mock
 import openpyxl
 
 from ais_monthly_app import (
+    APP_VERSION,
     AppConfig,
     DayInput,
     DIRECTION_ORDER,
@@ -68,6 +69,26 @@ def _read_legacy_grid(path: Path) -> dict[tuple[dt.date, int], float | None]:
         return grid
     finally:
         workbook.close()
+
+
+class ReleaseMetadataTests(unittest.TestCase):
+    def test_v15_version_metadata_are_consistent(self) -> None:
+        import tomllib
+
+        root = Path(__file__).parent
+        version = (root / "VERSION").read_text(encoding="utf-8").strip()
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        version_info = (root / "version_info.txt").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        usage = (root / "使用說明.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(APP_VERSION, "1.5.0")
+        self.assertEqual(version, APP_VERSION)
+        self.assertEqual(project["project"]["version"], APP_VERSION)
+        self.assertIn("filevers=(1, 5, 0, 0)", version_info)
+        self.assertIn("prodvers=(1, 5, 0, 0)", version_info)
+        self.assertIn("v1.5.0", readme)
+        self.assertIn("v1.5.0", usage)
 
 
 class SelectorBaselineTests(unittest.TestCase):

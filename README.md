@@ -10,9 +10,9 @@
 
 ![AIS 32 方位月報工具視窗](docs/images/app-window.png)
 
-## 下載與標準流程
+## 📥 下載與標準流程
 
-1. 從 [Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.0.zip`。
+1. 從 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.0.zip`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇原始月份資料夾；工具會從檔名辨識港別與年月。
 4. 按「開始全自動製作」。第一次執行會產生一份 Modern 分析與五份正式成果。
@@ -21,9 +21,34 @@
 
 不要直接修改五份交付 workbook；再次 finalization 會以已儲存的 Modern decision ledger 為唯一決策來源。
 
-Windows 可能因 EXE 尚未做商業程式碼簽章而顯示未知發行者。請只從本專案 Release 下載，並核對 Release 提供的 SHA-256。
+`Source code (zip)` 與 `Source code (tar.gz)` 是 GitHub 自動產生的原始碼封裝，不是一般 Windows 使用者的執行版。Windows 可能因 EXE 尚未做商業程式碼簽章而顯示未知發行者；請只從本專案 Release 下載，並核對 Release 提供的 SHA-256。
 
-## 六份輸出及其語意
+## 📄 輸入資料
+
+每日來源檔案需符合：
+
+```text
+D&TMOK <PORT>_YYYYMMDD_*.xlsx
+```
+
+例如：
+
+```text
+D&TMOK KLNG_20260701_11.xlsx
+D&TMOK KLNG_20260701_23.xlsx
+D&TMOK HWLN_20260101_part2.xlsx
+```
+
+程式會從檔名取得港別與日期。港別代碼採 2–16 位英數字、第一個字元為英文字母，大小寫不敏感並統一轉為大寫；支援範圍沒有寫死為 KLNG 或 HWLN。核心使用欄位包含：
+
+- `msg_type`
+- `LONGITUDE_DESC`
+- `bearing`
+- `distance in nautical miles`
+
+正式 provenance 另需可解析的 timestamp、MMSI 與 channel。若活頁簿第一頁為封面或說明頁，程式會自動尋找含必要欄位的 AIS 資料工作表。
+
+## 📊 六份輸出及其語意
 
 Modern workbook：
 
@@ -53,7 +78,7 @@ Period 是依每列實際時間切分，與 `_11`、`_23` 或其他尾碼無關�
 
 Modern logical-day final 與 Historical integrated 是兩種不同語意；因為群聚選值是非線性運算，前者不保證等於後者。
 
-## 兩套 profile 與覆核契約
+## 🧭 兩套 profile 與覆核契約
 
 - Modern research profile 預設訊息類型為 `1, 2, 3, 18, 19`，可在 GUI 或 `--message-types` 修改。
 - Historical delivery profile 固定為 `1, 3, 4, 18, 19`；修改 Modern profile 不會改變五份正式成果。
@@ -61,9 +86,9 @@ Modern logical-day final 與 Historical integrated 是兩種不同語意；因�
 - `period_a`／`period_b` 只能選擇同日、同 period、同方位、Historical profile 的真實 Candidate ID，或留白；不得輸入任意數字。
 - `top_candidates` 只控制 workbook 顯示筆數。selector 永遠搜尋完整合格資料，不能因顯示數量或是否輸出五檔而改變研究值。
 
-候選保存 timestamp、MMSI、channel、來源 fragment、工作表與來源列號，供人工判斷同船、同秒或跨 fragment 群聚風險。完整規則見 [docs/ALGORITHM.md](docs/ALGORITHM.md)。
+候選保存 timestamp、MMSI、channel、來源 fragment、工作表與來源列號，供人工判斷同船、同秒或跨 fragment 群聚風險。完整規則見 [`docs/ALGORITHM.md`](docs/ALGORITHM.md)。
 
-## 多 fragment、重複與異常資料
+## 🧩 多 fragment、重複與異常資料
 
 - 同港同日的所有 fragments 都會納入；排序不依賴 mtime、尾碼或檔案列舉順序。
 - byte-identical 檔案只處理一次，其他路徑記為 alias。
@@ -73,7 +98,7 @@ Modern logical-day final 與 Historical integrated 是兩種不同語意；因�
 
 程式不建立合併後的巨大來源 Excel。每個 logical day 會建立 profile-neutral normalized spool，保留 East、核心欄位有效的必要資料、`msg_type`、時間與 provenance，也保留超過 500 NM 的列；500 NM 只在 selector／renderer 階段套用。
 
-## 快取、容量與失敗保護
+## 💾 快取、容量與失敗保護
 
 - 每完成一個 logical day 就保存帶來源簽章與 checksum 的結果及 normalized spool；來源 metadata、分析設定或 cache/spool schema 變更時，對應日會安全重算。
 - 目前採每個 logical day 串流讀取後，以 bounded worker 數進行記憶體內 compact sorting；實測六月最高量日仍在可接受資源內，因此 v1.5.0 不加入 external merge 複雜度。
@@ -81,7 +106,7 @@ Modern logical-day final 與 Historical integrated 是兩種不同語意；因�
 - 每張 Excel 明細最多 `1,048,575` 筆資料列；超限會在發布前停止，絕不截斷。v1.5.0 不提供 split 模式。
 - 失敗時會保留已驗證的每日快取，並在輸出資料夾建立 `AIS月報_錯誤報告_*.txt`。
 
-## 命令列
+## ⌨️ 命令列
 
 首次分析並產生全部六份成果：
 
@@ -104,7 +129,7 @@ python .\ais_monthly_app.py `
 
 `--max-days N` 只供測試，永遠保留前 N 個完整 logical days；`--max-files` 與 `--legacy-output` 僅保留為 deprecated 相容參數。來源含多港別時必須指定 `--port`；`--year` 與 `--month` 只在同一港別含多月份時成對使用。
 
-## 從原始碼執行與測試
+## 🧪 從原始碼執行與測試
 
 需求：Windows、Python 3.11 以上。
 
@@ -124,21 +149,29 @@ python -m unittest discover -v
 - `AIS_JUNE_BASELINE_JSON`
 - `AIS_JUNE_BENCHMARK_JSON`
 
-## 建置 Windows EXE
+## 🪟 建置 Windows EXE
 
 ```powershell
 .\scripts\build_windows.ps1
 .\scripts\package_release.ps1 -SkipBuild
 ```
 
-建置結果位於 `dist\AIS_32方位月報工具.exe`；Release ZIP 與 `SHA256SUMS.txt` 也在 `dist`。
+建置結果位於 `dist\AIS_32方位月報工具.exe`；Release ZIP 與 `SHA256SUMS.txt` 也位於 `dist`。
 
-## 資料保護
+## 🔍 人工複核與已知限制
 
-- `.gitignore` 排除 Excel、CSV、cache、spool、`.building`、`.rollback`、錯誤報告與建置產物。
-- 不要在 Git、Issue、Pull Request 或 Release 附上真實 AIS、含 MMSI 的分析檔或 Golden workbook。
-- 程式完全離線運作，不需要 API Key 或 Token。
+自動分析用於減少逐日、逐方向的人工篩選與複製工作，但不取代領域人員判斷。32 方位邊界、21 個海向依據、AIS 去重、D&TMOK 上游 bearing/distance、時區與固定基點等研究 UNKNOWN，均未由程式自行推定或修改。
 
-## 授權
+## 🔒 資料保護
 
-[MIT License](LICENSE)
+本工具完全離線運作，不需要 API Key 或 Token，也不會自動上傳 AIS 資料。
+
+`.gitignore` 排除 Excel、CSV、cache、spool、`.building`、`.rollback`、錯誤報告與建置產物。不要在 Git、Issue、Pull Request 或 Release 附上真實 AIS、含 MMSI 的分析檔或 Golden workbook。
+
+## 📋 版本紀錄
+
+完整版本變更請見 [`CHANGELOG.md`](CHANGELOG.md)。最新正式版本與下載檔請見 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/latest)，發布格式與維護規範請見 [`docs/RELEASE_TEMPLATE.md`](docs/RELEASE_TEMPLATE.md)。
+
+## 📄 License
+
+本專案採用 [MIT License](LICENSE)。

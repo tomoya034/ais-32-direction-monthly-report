@@ -30,8 +30,8 @@ import xlsxwriter
 
 
 APP_TITLE = "AIS 32方位月報一鍵製作"
-APP_VERSION = "1.5.0"
-CACHE_VERSION = 4
+APP_VERSION = "1.5.1"
+CACHE_VERSION = 5
 NORMALIZED_SPOOL_VERSION = 1
 EXCEL_MAX_DATA_ROWS = 1_048_575
 NORMALIZED_SPOOL_MAGIC = b"AISNRM1\0"
@@ -42,13 +42,17 @@ HISTORICAL_MESSAGE_TYPES = (1, 3, 4, 18, 19)
 PERIOD_A = "period_a"
 PERIOD_B = "period_b"
 LOGICAL_DAY = "logical_day"
-REVIEW_WORKBOOK_SCHEMA = "AIS_V15_REVIEW_1"
+REVIEW_WORKBOOK_SCHEMA = "AIS_V15_REVIEW_2"
 
 DIRECTION_ORDER = [
-    "北", "北微東", "北北東", "東北微北", "東北", "東北微東", "東北東", "東微北", "東",
-    "東微南", "東南東", "東南微南", "東南", "東南微西", "南南東", "南微東", "南",
-    "南微西", "南南西", "西南微南", "西南", "西南微西", "西南西", "西微南", "西",
-    "西微北", "西北西", "西北微西", "西北", "西北微北", "北北西", "北微西",
+    "北", "北微東", "東北偏北", "東北微北",
+    "東北", "東北微東", "東北偏東", "東微北",
+    "東", "東微南", "東南偏東", "東南微東",
+    "東南", "東南微南", "東南偏南", "南微東",
+    "南", "南微西", "西南偏南", "西南微南",
+    "西南", "西南微西", "西南偏西", "西微南",
+    "西", "西微北", "西北偏西", "西北微西",
+    "西北", "西北微北", "西北偏北", "北微西",
 ]
 
 LEGACY_DIRECTION_ABBREVIATIONS = [
@@ -57,10 +61,10 @@ LEGACY_DIRECTION_ABBREVIATIONS = [
     "WSW", "WbS", "W", "WbN", "WNW", "NWbW", "NW", "NWbN", "NNW", "NbW",
 ]
 
-# 影片所示：北至東南東，以及西南西至北微西，共 21 個海向方位。
+# 北至東南偏東、西南偏西至北微西，共 21 方位。
 OPEN_SEA_INDEXES = tuple(range(0, 11)) + tuple(range(22, 32))
 OPEN_SEA_DIRECTIONS = tuple(DIRECTION_ORDER[index] for index in OPEN_SEA_INDEXES)
-COASTAL_REVIEW_DIRECTIONS = {"西南西", "西微南", "西"}
+COASTAL_REVIEW_DIRECTIONS = {"西南偏西", "西微南", "西"}
 
 FILENAME_RE = re.compile(
     r"^D&TMOK[ \t]+(?P<port>[A-Z][A-Z0-9]{1,15})_(?P<date>\d{8})(?:_(?P<suffix>[A-Z0-9_-]+))?\.xlsx$",
@@ -1881,6 +1885,17 @@ def resolve_decision_values(
     return values
 
 
+def validate_review_workbook_schema(schema: object) -> None:
+    if schema == "AIS_V15_REVIEW_1":
+        raise ValueError(
+            "v1.5.0 覆核 workbook 不相容：v1.5.1 已修正 32 方位中文名稱。"
+            "請由原始月份資料重新分析並覆核，以避免 decision direction 錯置；"
+            "不支援舊 workbook 自動 migration。"
+        )
+    if schema != REVIEW_WORKBOOK_SCHEMA:
+        raise ValueError("覆核 workbook schema 版本不相容。")
+
+
 def read_review_decisions(
     workbook_path: Path,
     *,
@@ -1891,14 +1906,13 @@ def read_review_decisions(
     try:
         required_sheets = {"系統資料", "決策台帳", "候選清單"}
         if not required_sheets.issubset(workbook.sheetnames):
-            raise ValueError("不是 v1.5.0 覆核 workbook：缺少系統資料、決策台帳或候選清單。")
+            raise ValueError("不是有效的覆核 workbook：缺少系統資料、決策台帳或候選清單。")
         system = workbook["系統資料"]
         metadata = {
             str(system.cell(row=row, column=1).value): system.cell(row=row, column=2).value
             for row in range(1, system.max_row + 1)
         }
-        if metadata.get("Schema") != REVIEW_WORKBOOK_SCHEMA:
-            raise ValueError("覆核 workbook schema 版本不相容。")
+        validate_review_workbook_schema(metadata.get("Schema"))
         manifest_hash = str(metadata.get("Source manifest SHA-256", ""))
         if expected_manifest_hash is not None and manifest_hash != expected_manifest_hash:
             raise ValueError("來源 fragment manifest 已變更；不可沿用舊覆核決策。")
@@ -2119,7 +2133,7 @@ def write_monthly_workbook(
         ("距離上限", f"{config.max_distance:g} NM；超過者不納入自動值並保留計數"),
         ("群聚規則", f"由高至低尋找至少 {config.cluster_size} 筆、彼此位於最高值減 {config.tolerance:.0%} 範圍內的第一群"),
         ("候選顯示", f"每個 scope／方向顯示前 {config.top_candidates} 筆；完整 selector 搜尋不受此數量影響"),
-        ("處理方位", "北至東南東、西南西至北微西，共 21 方位；朝向臺灣的中間 11 方位不處理"),
+        ("處理方位", "北至東南偏東、西南偏西至北微西，共 21 方位；朝向臺灣的中間 11 方位不處理"),
         ("原始資料", "所有來源檔只讀取、不修改；清理與覆核結果另存於本月報"),
     ]
     for row, (label, value) in enumerate(settings, start=3):
@@ -3137,7 +3151,7 @@ def _write_period_full_workbook(
                     if excel_row > EXCEL_MAX_DATA_ROWS:
                         raise SourceFileError(
                             f"{day_result.day} {scope} retained detail 超過 Excel 上限 "
-                            f"{EXCEL_MAX_DATA_ROWS:,} 列；v1.5.0 不會截斷。"
+                            f"{EXCEL_MAX_DATA_ROWS:,} 列；程式不會截斷。"
                         )
                     sheet.write_number(excel_row, 0, record.distance)
                     sheet.write_number(excel_row, 1, record.bearing)
@@ -3338,7 +3352,7 @@ def _review_workbook_metadata(path: Path) -> dict[str, object]:
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
     try:
         if "系統資料" not in workbook.sheetnames:
-            raise ValueError("不是 v1.5.0 覆核 workbook：缺少系統資料。")
+            raise ValueError("不是有效的覆核 workbook：缺少系統資料。")
         sheet = workbook["系統資料"]
         return {
             str(row[0]): row[1]
@@ -3356,8 +3370,7 @@ def config_from_review_workbook(
     overwrite: bool = False,
 ) -> AppConfig:
     metadata = _review_workbook_metadata(path)
-    if metadata.get("Schema") != REVIEW_WORKBOOK_SCHEMA:
-        raise ValueError("覆核 workbook schema 版本不相容。")
+    validate_review_workbook_schema(metadata.get("Schema"))
     period = str(metadata.get("Period", ""))
     match = re.fullmatch(r"(\d{4})-(\d{2})", period)
     if match is None:
@@ -4215,7 +4228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--legacy-overflow",
         choices=("error",),
         default="error",
-        help="v1.5.0 固定為 error；明細超過 Excel 上限時不截斷",
+        help="固定為 error；明細超過 Excel 上限時不截斷",
     )
     arguments = parser.parse_args(argv)
 
@@ -4281,7 +4294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--legacy-output 的父資料夾與 --delivery-dir 不一致")
         delivery_dir = legacy_parent
         print(
-            "Warning: --legacy-output 已淘汰；v1.5.0 將固定產生五份成果，並只沿用該路徑的父資料夾。",
+            "Warning: --legacy-output 已淘汰；將固定產生五份成果，並只沿用該路徑的父資料夾。",
             file=sys.stderr,
             flush=True,
         )

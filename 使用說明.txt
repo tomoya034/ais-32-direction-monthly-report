@@ -1,5 +1,14 @@
-AIS 32 方位月報一鍵製作 v1.5.0
+AIS 32 方位月報一鍵製作 v1.5.1
 =================================
+
+【v1.5.1 中文方向名稱與升級】
+32 方位中文名稱採中文維基百科〈羅盤方位〉表的「中文名」欄，不採「又名」欄。
+https://zh.wikipedia.org/zh-tw/羅盤方位
+SEbE = 東南微東、SEbS = 東南微南；英文縮寫、bearing 分箱與研究數值不變。
+北至東南偏東、西南偏西至北微西，共 21 方位。
+cache version 升為 5，舊 cache 安全失效；normalized spool version 維持 1。
+review schema 升為 AIS_V15_REVIEW_2。v1.5.0 覆核 workbook 不相容：
+請由原始月份資料重新分析並覆核，避免 decision direction 錯置，不提供自動 migration。
 
 【第一次分析】
 1. 雙擊 AIS_32方位月報工具.exe；不需要 Python、Token 或 API Key。

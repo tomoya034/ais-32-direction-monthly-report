@@ -8,6 +8,18 @@
 
 尚無未發布變更。
 
+## [1.5.2] - 2026-09-15
+
+### Fixed
+
+- 修正多港別共用 KLNG 21 方位排除清單。加入可追溯的 `auto`／`klng21`／`all32` 設定；auto 對 KLNG 維持原規則，其他站點不套用 KLNG 地理排除。
+- 總表、覆核台帳、每日明細、Period A/B、整合及交付驗證使用同一方位設定，缺資料仍留白。
+- 雷達圖加入 `auto`／`line`／`filled` 和獨立的刻度上限；auto 對 KLNG 保留線形、其他站點採填色；不容許指定上限裁掉有效數值。
+- 方位設定納入快取及覆核身分；cache 6、review schema `AIS_V15_REVIEW_3`，舊覆核須重新分析，防止以舊 HWLN 21 方位台帳覆蓋 32 方位。
+- 修正 XLSX 的 MAXIFS、STDEV.S 公式序列化，加入必要的 `_xlfn.` 前綴，避免 Microsoft Excel 重新計算出現 `#NAME?` 後被總表 IFERROR 隱藏成空白。公式的計算範圍及數學意義不變。
+- 填色雷達省略全無有效值的日期系列，月份表格與缺日紀錄仍保留；座標刻度使用整數 NM，避免長刻度文字與方位標籤重疊。
+- 未改動 AIS 訊息規則、bearing 分箱、群聚選值、Period 定義或 KLNG 既有數值契約。`all32` 是保留資料的工程設定，不宣稱各站全部方向都是海域。
+
 ## [1.5.1] - 2026-09-07
 
 ### Fixed
@@ -119,7 +131,8 @@
 - Excel 圖表、待複核清單與人工覆核欄。
 - PyInstaller 單一 EXE 建置腳本及自動測試。
 
-[Unreleased]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.3.0...v1.4.0

@@ -83,13 +83,13 @@ class ReleaseMetadataTests(unittest.TestCase):
         readme = (root / "README.md").read_text(encoding="utf-8")
         usage = (root / "使用說明.txt").read_text(encoding="utf-8")
 
-        self.assertEqual(APP_VERSION, "1.5.1")
+        self.assertEqual(APP_VERSION, "1.5.2")
         self.assertEqual(version, APP_VERSION)
         self.assertEqual(project["project"]["version"], APP_VERSION)
-        self.assertIn("filevers=(1, 5, 1, 0)", version_info)
-        self.assertIn("prodvers=(1, 5, 1, 0)", version_info)
-        self.assertIn("v1.5.1", readme)
-        self.assertIn("v1.5.1", usage)
+        self.assertIn("filevers=(1, 5, 2, 0)", version_info)
+        self.assertIn("prodvers=(1, 5, 2, 0)", version_info)
+        self.assertIn("v1.5.2", readme)
+        self.assertIn("v1.5.2", usage)
 
 
 class SelectorBaselineTests(unittest.TestCase):

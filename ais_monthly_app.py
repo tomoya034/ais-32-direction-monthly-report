@@ -30,8 +30,8 @@ import xlsxwriter
 
 
 APP_TITLE = "AIS 32方位月報一鍵製作"
-APP_VERSION = "1.5.1"
-CACHE_VERSION = 5
+APP_VERSION = "1.5.2"
+CACHE_VERSION = 6
 NORMALIZED_SPOOL_VERSION = 1
 EXCEL_MAX_DATA_ROWS = 1_048_575
 NORMALIZED_SPOOL_MAGIC = b"AISNRM1\0"
@@ -42,7 +42,7 @@ HISTORICAL_MESSAGE_TYPES = (1, 3, 4, 18, 19)
 PERIOD_A = "period_a"
 PERIOD_B = "period_b"
 LOGICAL_DAY = "logical_day"
-REVIEW_WORKBOOK_SCHEMA = "AIS_V15_REVIEW_2"
+REVIEW_WORKBOOK_SCHEMA = "AIS_V15_REVIEW_3"
 
 DIRECTION_ORDER = [
     "北", "北微東", "東北偏北", "東北微北",
@@ -61,10 +61,12 @@ LEGACY_DIRECTION_ABBREVIATIONS = [
     "WSW", "WbS", "W", "WbN", "WNW", "NWbW", "NW", "NWbN", "NNW", "NbW",
 ]
 
-# 北至東南偏東、西南偏西至北微西，共 21 方位。
+# KLNG historical policy only. Other ports must not inherit this geographic mask.
 OPEN_SEA_INDEXES = tuple(range(0, 11)) + tuple(range(22, 32))
 OPEN_SEA_DIRECTIONS = tuple(DIRECTION_ORDER[index] for index in OPEN_SEA_INDEXES)
 COASTAL_REVIEW_DIRECTIONS = {"西南偏西", "西微南", "西"}
+DIRECTION_POLICIES = ("auto", "klng21", "all32")
+RADAR_STYLES = ("auto", "line", "filled")
 
 FILENAME_RE = re.compile(
     r"^D&TMOK[ \t]+(?P<port>[A-Z][A-Z0-9]{1,15})_(?P<date>\d{8})(?:_(?P<suffix>[A-Z0-9_-]+))?\.xlsx$",
@@ -231,11 +233,46 @@ class AppConfig:
     overwrite: bool = False
     max_days: int | None = None
     max_files: int | None = None
+    direction_policy: str = "auto"
+    radar_style: str = "auto"
+    radar_max: float | None = None
 
     def __post_init__(self) -> None:
         self.port = normalize_port(self.port)
+        if self.radar_max is not None:
+            self.radar_max = float(self.radar_max)
+
+    @property
+    def resolved_direction_policy(self) -> str:
+        return resolve_direction_policy(self.port, self.direction_policy)
+
+    @property
+    def direction_indexes(self) -> tuple[int, ...]:
+        return OPEN_SEA_INDEXES if self.resolved_direction_policy == "klng21" else tuple(range(32))
+
+    @property
+    def directions(self) -> tuple[str, ...]:
+        return tuple(DIRECTION_ORDER[index] for index in self.direction_indexes)
+
+    @property
+    def direction_policy_description(self) -> str:
+        if self.resolved_direction_policy == "klng21":
+            return "klng21：KLNG 歷史 21 方位設定；排除 SEbE 至 SWbW，不推廣為其他港別地理規則"
+        return "all32：保留全部 32 方位，不套用地理遮罩；這是無遮罩處理設定，非已驗證的港別海向政策"
+
+    @property
+    def resolved_radar_style(self) -> str:
+        if self.radar_style not in RADAR_STYLES:
+            raise ValueError("雷達圖樣式必須是 auto、line 或 filled。")
+        if self.radar_style == "auto":
+            return "line" if self.port == "KLNG" else "filled"
+        return self.radar_style
 
     def validate(self) -> None:
+        self.resolved_direction_policy
+        self.resolved_radar_style
+        if self.radar_max is not None and (not math.isfinite(self.radar_max) or self.radar_max <= 0):
+            raise ValueError("雷達圖刻度上限必須是有限正數，或留空由 Excel 自動設定。")
         if not self.input_dir.is_dir():
             raise ValueError(f"來源資料夾不存在：{self.input_dir}")
         if not 2000 <= self.year <= 2100:
@@ -343,6 +380,76 @@ def normalize_port(port: str) -> str:
     if not PORT_RE.fullmatch(normalized):
         raise ValueError("港別代碼必須是 2–16 位英數字，且第一個字元必須是英文字母。")
     return normalized
+
+
+def resolve_direction_policy(port: str, policy: str = "auto") -> str:
+    if policy not in DIRECTION_POLICIES:
+        raise ValueError("方位政策必須是 auto、klng21 或 all32。")
+    if policy == "auto":
+        return "klng21" if normalize_port(port) == "KLNG" else "all32"
+    return policy
+
+
+def _review_direction_policy(metadata: dict[str, object]) -> str:
+    policy = str(metadata.get("Direction policy", ""))
+    if policy not in ("klng21", "all32"):
+        raise ValueError("覆核 workbook 缺少已解析的 Direction policy；請重新分析來源資料。")
+    return policy
+
+
+def _radar_options(config: AppConfig, *, modern: bool = False) -> dict[str, str]:
+    options = {"type": "radar"}
+    if config.resolved_radar_style == "filled":
+        options["subtype"] = "filled"
+    elif modern:
+        options["subtype"] = "with_markers"
+    return options
+
+
+def _radar_series_style(config: AppConfig, color: str, *, modern: bool = False) -> dict[str, object]:
+    style: dict[str, object] = {
+        "line": {"color": color, "width": 0.75, "transparency": 45 if modern else 35},
+    }
+    if config.resolved_radar_style == "filled":
+        style["fill"] = {"color": color, "transparency": 35}
+    if modern:
+        style["marker"] = {"type": "none"}
+    return style
+
+
+def _validate_radar_max(config: AppConfig, values: Iterable[float | None]) -> None:
+    if config.radar_max is None:
+        return
+    if not math.isfinite(config.radar_max) or config.radar_max <= 0:
+        raise ValueError("雷達圖刻度上限必須是有限正數。")
+    maximum = max((float(value) for value in values if value is not None), default=0.0)
+    if config.radar_max < maximum:
+        raise ValueError(
+            f"雷達圖刻度上限 {config.radar_max:g} NM 會截掉有效值 {maximum:g} NM；"
+            "請提高 --radar-max 或使用自動刻度。"
+        )
+
+
+def _configure_radar_axis(chart: object, config: AppConfig, values: Iterable[float | None]) -> None:
+    """A display limit must never hide a retained observation; absent values stay blank."""
+    _validate_radar_max(config, values)
+    chart.show_blanks_as("gap")
+    axis_options: dict[str, object] = {}
+    if config.resolved_radar_style == "filled":
+        axis_options["num_format"] = "0"
+    if config.radar_max is not None:
+        axis_options.update({"min": 0, "max": config.radar_max})
+    if axis_options:
+        chart.set_y_axis(axis_options)
+
+
+def _write_policy_properties(workbook: xlsxwriter.Workbook, config: AppConfig) -> None:
+    workbook.set_custom_property("Application version", APP_VERSION)
+    workbook.set_custom_property("Port", config.port)
+    workbook.set_custom_property("Direction policy", config.resolved_direction_policy)
+    workbook.set_custom_property("Direction policy note", config.direction_policy_description)
+    workbook.set_custom_property("Radar style", config.resolved_radar_style)
+    workbook.set_custom_property("Radar maximum NM", "auto" if config.radar_max is None else config.radar_max)
 
 
 def parse_source_filename(filename: str) -> SourceFileIdentity | None:
@@ -608,6 +715,8 @@ def select_cluster(
     cluster_size: int,
     over_cap_count: int,
     over_cap_max: float | None,
+    *,
+    coastal_review: bool = True,
 ) -> DirectionResult:
     result = DirectionResult(
         direction=direction,
@@ -638,7 +747,7 @@ def select_cluster(
                 f"第 {start + 1} 名起有 {count} 筆落在 {tolerance:.0%} 範圍內"
                 + (f"；前 {discarded} 筆視為孤立值" if discarded else "")
             )
-            if direction in COASTAL_REVIEW_DIRECTIONS and candidate.distance > 10:
+            if coastal_review and direction in COASTAL_REVIEW_DIRECTIONS and candidate.distance > 10:
                 result.status = "待複核"
                 result.reason += "；此岸向方位超過影片提示的 10 NM 經驗值"
             return result
@@ -700,7 +809,7 @@ def select_cluster_from_sorted_rows(
             f"第 {rank} 名起有 {result.cluster_count} 筆落在 {config.tolerance:.0%} 範圍內"
             + (f"；前 {rank - 1} 筆視為孤立值" if rank > 1 else "")
         )
-        if direction in COASTAL_REVIEW_DIRECTIONS and candidate_distance > 10:
+        if config.resolved_direction_policy == "klng21" and direction in COASTAL_REVIEW_DIRECTIONS and candidate_distance > 10:
             result.status = "待複核"
             result.reason += "；此岸向方位超過影片提示的 10 NM 經驗值"
         if rank > config.top_candidates:
@@ -836,6 +945,7 @@ def _legacy_spool_path(config: AppConfig, parsed_day: date) -> Path:
 def _cache_signature(day_input: DayInput, config: AppConfig) -> dict[str, object]:
     return {
         "cache_version": CACHE_VERSION,
+        "direction_policy": config.resolved_direction_policy,
         "sources": [
             {
                 "path": str(fragment.path.resolve()),
@@ -1568,6 +1678,9 @@ def process_month(
         month=job.month,
         source_count=len(job.days),
         fragment_count=sum(len(day_input.fragments) for day_input in job.days),
+        direction_policy=config.direction_policy_description,
+        radar_style=config.resolved_radar_style,
+        radar_max=config.radar_max,
     )
 
     required, free = preflight_output_space(
@@ -1690,6 +1803,9 @@ def _scope_directions(day_result: DayResult, scope: str) -> dict[str, DirectionR
 def source_manifest_hash(config: AppConfig, day_results: Sequence[DayResult]) -> str:
     payload = {
         "schema": REVIEW_WORKBOOK_SCHEMA,
+        "direction_policy": config.resolved_direction_policy,
+        "radar_style": config.resolved_radar_style,
+        "radar_max": config.radar_max,
         "port": config.port,
         "year": config.year,
         "month": config.month,
@@ -1721,7 +1837,7 @@ def build_default_decision_snapshot(
     for day_result in day_results:
         for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B):
             directions = _scope_directions(day_result, scope)
-            for direction_index in OPEN_SEA_INDEXES:
+            for direction_index in config.direction_indexes:
                 direction = DIRECTION_ORDER[direction_index]
                 result = directions.get(direction, DirectionResult(direction=direction))
                 decisions.append(
@@ -1762,7 +1878,7 @@ def validate_decision_snapshot_contract(
         (scope, day_result.day, direction)
         for day_result in day_results
         for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B)
-        for direction in OPEN_SEA_DIRECTIONS
+        for direction in config.directions
     }
     actual = set(keys)
     if actual != expected:
@@ -1892,6 +2008,11 @@ def validate_review_workbook_schema(schema: object) -> None:
             "請由原始月份資料重新分析並覆核，以避免 decision direction 錯置；"
             "不支援舊 workbook 自動 migration。"
         )
+    if schema == "AIS_V15_REVIEW_2":
+        raise ValueError(
+            "v1.5.1 覆核 workbook 缺少港別方位政策；v1.5.2 不會把舊 21 方位台帳自動升為 32 方位。"
+            "請由原始月份資料重新分析並覆核。"
+        )
     if schema != REVIEW_WORKBOOK_SCHEMA:
         raise ValueError("覆核 workbook schema 版本不相容。")
 
@@ -1917,6 +2038,9 @@ def read_review_decisions(
         if expected_manifest_hash is not None and manifest_hash != expected_manifest_hash:
             raise ValueError("來源 fragment manifest 已變更；不可沿用舊覆核決策。")
         port = normalize_port(str(metadata.get("Port", "")))
+        direction_policy = _review_direction_policy(metadata)
+        allowed_indexes = OPEN_SEA_INDEXES if direction_policy == "klng21" else tuple(range(32))
+        allowed_directions = tuple(DIRECTION_ORDER[index] for index in allowed_indexes)
         period = str(metadata.get("Period", ""))
         match = re.fullmatch(r"(\d{4})-(\d{2})", period)
         if match is None:
@@ -1957,8 +2081,8 @@ def read_review_decisions(
             else:
                 raise ValueError(f"決策台帳 B{row} 的日期無效。")
             direction = str(ledger.cell(row=row, column=3).value)
-            if direction not in OPEN_SEA_DIRECTIONS:
-                raise ValueError(f"決策台帳 C{row} 的方位不在 21 個海向內。")
+            if direction not in allowed_directions:
+                raise ValueError(f"決策台帳 C{row} 的方位不在 workbook 方位政策內。")
             key = (scope, parsed_day, direction)
             if key in seen:
                 raise ValueError(f"決策台帳第 {row} 列與前列重複：{key}")
@@ -2053,6 +2177,10 @@ def write_monthly_workbook(
     if decision_snapshot.source_manifest_hash != expected_manifest:
         raise ValueError("決策 snapshot 的來源 fragment manifest 不一致。")
     decision_values = resolve_decision_values(decision_snapshot, day_results, config)
+    _validate_radar_max(
+        config,
+        (decision_values.get((LOGICAL_DAY, day.day, direction)) for day in day_results for direction in config.directions),
+    )
     decisions_by_key = decision_snapshot.by_key()
     warnings = list(warnings) + [
         f"{day_result.day:%Y-%m-%d}：{diagnostic}"
@@ -2081,6 +2209,7 @@ def write_monthly_workbook(
         }
     )
     workbook.set_calc_mode("auto")
+    _write_policy_properties(workbook, config)
 
     formats = {
         "title": workbook.add_format(
@@ -2133,7 +2262,9 @@ def write_monthly_workbook(
         ("距離上限", f"{config.max_distance:g} NM；超過者不納入自動值並保留計數"),
         ("群聚規則", f"由高至低尋找至少 {config.cluster_size} 筆、彼此位於最高值減 {config.tolerance:.0%} 範圍內的第一群"),
         ("候選顯示", f"每個 scope／方向顯示前 {config.top_candidates} 筆；完整 selector 搜尋不受此數量影響"),
-        ("處理方位", "北至東南偏東、西南偏西至北微西，共 21 方位；朝向臺灣的中間 11 方位不處理"),
+        ("處理方位", config.direction_policy_description),
+        ("雷達圖樣式", config.resolved_radar_style),
+        ("雷達圖刻度上限", "Excel 自動刻度" if config.radar_max is None else f"{config.radar_max:g} NM；不允許截掉有效值"),
         ("原始資料", "所有來源檔只讀取、不修改；清理與覆核結果另存於本月報"),
     ]
     for row, (label, value) in enumerate(settings, start=3):
@@ -2199,7 +2330,7 @@ def write_monthly_workbook(
     candidate_row = 1
     for day_result in day_results:
         for scope in (LOGICAL_DAY, PERIOD_A, PERIOD_B):
-            for direction_index in OPEN_SEA_INDEXES:
+            for direction_index in config.direction_indexes:
                 direction = DIRECTION_ORDER[direction_index]
                 direction_result = _scope_directions(day_result, scope).get(direction)
                 if direction_result is None:
@@ -2323,6 +2454,10 @@ def write_monthly_workbook(
         ("Schema", REVIEW_WORKBOOK_SCHEMA),
         ("Port", config.port),
         ("Period", f"{config.year}-{config.month:02d}"),
+        ("Direction policy", config.resolved_direction_policy),
+        ("Direction policy note", config.direction_policy_description),
+        ("Radar style", config.resolved_radar_style),
+        ("Radar maximum NM", config.radar_max if config.radar_max is not None else "auto"),
         ("Source manifest SHA-256", decision_snapshot.source_manifest_hash),
         ("Modern message types", ",".join(map(str, config.message_types))),
         ("Historical delivery message types", ",".join(map(str, HISTORICAL_MESSAGE_TYPES))),
@@ -2381,7 +2516,7 @@ def write_monthly_workbook(
 
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             column = 7 + direction_index
-            if direction_index in OPEN_SEA_INDEXES:
+            if direction_index in config.direction_indexes:
                 sheet.write(0, column, direction, formats["header"])
             else:
                 sheet.write(0, column, direction, formats["excluded"])
@@ -2394,7 +2529,7 @@ def write_monthly_workbook(
         candidate_rows: list[tuple[float, float, str, int, int, str]] = []
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             column = 7 + direction_index
-            if direction_index not in OPEN_SEA_INDEXES:
+            if direction_index not in config.direction_indexes:
                 for row in range(1, 6):
                     sheet.write(row, column, "不處理" if row == 4 else "", formats["excluded"])
                 continue
@@ -2460,7 +2595,7 @@ def write_monthly_workbook(
     total_sheet.write(3, 0, "日期", formats["header"])
     for direction_index, direction in enumerate(DIRECTION_ORDER):
         column = 1 + direction_index
-        total_sheet.write(3, column, direction, formats["header"] if direction_index in OPEN_SEA_INDEXES else formats["excluded"])
+        total_sheet.write(3, column, direction, formats["header"] if direction_index in config.direction_indexes else formats["excluded"])
 
     first_data_row_excel = 5
     last_data_row_excel = 4 + len(day_results)
@@ -2469,7 +2604,7 @@ def write_monthly_workbook(
         source_sheet = daily_sheet_names[day_result.day]
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             column = 1 + direction_index
-            if direction_index not in OPEN_SEA_INDEXES:
+            if direction_index not in config.direction_indexes:
                 total_sheet.write_blank(row_index, column, None, formats["excluded"])
                 continue
             direction_result = day_result.directions[direction]
@@ -2481,7 +2616,7 @@ def write_monthly_workbook(
             total_sheet.write_formula(row_index, column, formula, status_format, cached)
 
     stat_start_row = 5 + len(day_results)
-    stat_specs = [("MAX", "MAX"), ("MIN", "MIN"), ("平均", "AVERAGE"), ("標準差", "STDEV.S")]
+    stat_specs = [("MAX", "MAX"), ("MIN", "MIN"), ("平均", "AVERAGE"), ("標準差", "_xlfn.STDEV.S")]
     stat_values_by_direction: dict[str, tuple[float | None, float | None, float | None, float | None]] = {}
     for direction in DIRECTION_ORDER:
         stat_values_by_direction[direction] = _stats(
@@ -2492,7 +2627,7 @@ def write_monthly_workbook(
         total_sheet.write(row, 0, label, formats["stat_label"])
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             column = 1 + direction_index
-            if direction_index not in OPEN_SEA_INDEXES:
+            if direction_index not in config.direction_indexes:
                 total_sheet.write_blank(row, column, None, formats["excluded"])
                 continue
             col_letter = _excel_col(column)
@@ -2501,11 +2636,11 @@ def write_monthly_workbook(
             total_sheet.write_formula(row, column, formula, formats["stat"], cached if cached is not None else "")
 
     helper_row = 3
-    total_sheet.write(helper_row, 34, "海向方位", formats["header"])
+    total_sheet.write(helper_row, 34, "納入方位", formats["header"])
     total_sheet.write(helper_row, 35, "MAX", formats["header"])
     total_sheet.write(helper_row, 36, "MIN", formats["header"])
     total_sheet.write(helper_row, 37, "平均", formats["header"])
-    for helper_offset, direction_index in enumerate(OPEN_SEA_INDEXES, start=1):
+    for helper_offset, direction_index in enumerate(config.direction_indexes, start=1):
         row = helper_row + helper_offset
         direction = DIRECTION_ORDER[direction_index]
         source_col = _excel_col(1 + direction_index)
@@ -2516,12 +2651,12 @@ def write_monthly_workbook(
             cached = stat_values_by_direction[direction][stat_offset]
             total_sheet.write_formula(row, helper_col, formula, formats["number"], cached if cached is not None else "")
 
-    radar = workbook.add_chart({"type": "radar", "subtype": "with_markers"})
+    radar = workbook.add_chart(_radar_options(config, modern=True))
     palette = ["#2F6B7C", "#D97706", "#7C3AED", "#15803D", "#B91C1C", "#0369A1", "#A21CAF"]
     for day_offset, day_result in enumerate(day_results):
         if not any(
             decision_values.get((LOGICAL_DAY, day_result.day, DIRECTION_ORDER[index])) is not None
-            for index in OPEN_SEA_INDEXES
+            for index in config.direction_indexes
         ):
             continue
         excel_row = first_data_row_excel + day_offset
@@ -2530,23 +2665,27 @@ def write_monthly_workbook(
                 "name": f"{config.month}/{day_result.day.day}",
                 "categories": ["總表", 3, 1, 3, 32],
                 "values": ["總表", excel_row - 1, 1, excel_row - 1, 32],
-                "line": {"color": palette[day_offset % len(palette)], "width": 0.75, "transparency": 45},
-                "marker": {"type": "none"},
+                "values_data": [decision_values.get((LOGICAL_DAY, day_result.day, direction)) for direction in DIRECTION_ORDER],
+                **_radar_series_style(config, palette[day_offset % len(palette)], modern=True),
             }
         )
     radar.set_title({"name": f"{config.year}-{config.month:02d} AIS 通訊涵蓋圖"})
     radar.set_legend({"position": "bottom", "font": {"size": 8}})
     radar.set_size({"width": 1080, "height": 560})
     radar.set_style(10)
+    _configure_radar_axis(
+        radar, config,
+        (decision_values.get((LOGICAL_DAY, day.day, direction)) for day in day_results for direction in config.directions),
+    )
 
     columns = workbook.add_chart({"type": "column"})
-    category_range = ["總表", helper_row + 1, 34, helper_row + len(OPEN_SEA_INDEXES), 34]
+    category_range = ["總表", helper_row + 1, 34, helper_row + len(config.direction_indexes), 34]
     for series_name, helper_col, color in (("最遠", 35, "#2F6B7C"), ("最近", 36, "#D97706")):
         columns.add_series(
             {
                 "name": series_name,
                 "categories": category_range,
-                "values": ["總表", helper_row + 1, helper_col, helper_row + len(OPEN_SEA_INDEXES), helper_col],
+                "values": ["總表", helper_row + 1, helper_col, helper_row + len(config.direction_indexes), helper_col],
                 "fill": {"color": color, "transparency": 10},
                 "border": {"none": True},
             }
@@ -2556,7 +2695,7 @@ def write_monthly_workbook(
         {
             "name": "平均",
             "categories": category_range,
-            "values": ["總表", helper_row + 1, 37, helper_row + len(OPEN_SEA_INDEXES), 37],
+            "values": ["總表", helper_row + 1, 37, helper_row + len(config.direction_indexes), 37],
             "line": {"color": "#B91C1C", "width": 2.25},
             "marker": {"type": "circle", "size": 4, "border": {"color": "#B91C1C"}, "fill": {"color": "#FFFFFF"}},
         }
@@ -2592,7 +2731,7 @@ def write_monthly_workbook(
         review_sheet.write(0, column, header, formats["header"])
     review_row = 1
     for day_result in day_results:
-        for direction_index in OPEN_SEA_INDEXES:
+        for direction_index in config.direction_indexes:
             direction = DIRECTION_ORDER[direction_index]
             direction_result = day_result.directions[direction]
             if direction_result.status == "自動採用":
@@ -2704,6 +2843,7 @@ def write_legacy_workbook(
         }
     )
     workbook.set_calc_mode("auto")
+    _write_policy_properties(workbook, config)
     header_format = workbook.add_format({"bold": True, "align": "center", "bottom": 1})
     number_format = workbook.add_format({"num_format": "0.000"})
     date_format = workbook.add_format({"num_format": "m月d日"})
@@ -2727,7 +2867,7 @@ def write_legacy_workbook(
             sheet.write_row(0, 7, DIRECTION_ORDER, header_format)
             for direction_index, direction in enumerate(DIRECTION_ORDER):
                 selected = day_result.directions[direction].selected
-                if direction_index in OPEN_SEA_INDEXES and selected is not None:
+                if direction_index in config.direction_indexes and selected is not None:
                     sheet.write_number(1, 7 + direction_index, selected, number_format)
 
             spool_path = _legacy_spool_path(config, day_result.day)
@@ -2768,7 +2908,7 @@ def write_legacy_workbook(
             summary.write_datetime(row, 0, datetime.combine(day_result.day, datetime.min.time()), date_format)
             source_sheet = daily_names[day_result.day]
             for direction_index, direction in enumerate(DIRECTION_ORDER):
-                if direction_index not in OPEN_SEA_INDEXES:
+                if direction_index not in config.direction_indexes:
                     summary.write_blank(row, 1 + direction_index, None, number_format)
                     continue
                 source_column = _excel_col(7 + direction_index)
@@ -2781,7 +2921,7 @@ def write_legacy_workbook(
         stats_by_direction = {
             direction: (
                 _stats(day.directions[direction].selected for day in day_results)
-                if direction_index in OPEN_SEA_INDEXES
+                if direction_index in config.direction_indexes
                 else (None, None, None, None)
             )
             for direction_index, direction in enumerate(DIRECTION_ORDER)
@@ -2791,7 +2931,7 @@ def write_legacy_workbook(
             summary.write(row, 0, label, stat_label_format)
             for direction_index, direction in enumerate(DIRECTION_ORDER):
                 column = 1 + direction_index
-                if direction_index not in OPEN_SEA_INDEXES:
+                if direction_index not in config.direction_indexes:
                     summary.write_blank(row, column, None, number_format)
                     continue
                 cached = stats_by_direction[direction][stat_index]
@@ -2800,12 +2940,12 @@ def write_legacy_workbook(
                 else:
                     summary.write_number(row, column, cached, number_format)
 
-        radar = workbook.add_chart({"type": "radar"})
+        radar = workbook.add_chart(_radar_options(config))
         palette = ["#4472C4", "#ED7D31", "#70AD47", "#A5A5A5", "#FFC000", "#5B9BD5"]
         for day_offset, day_result in enumerate(day_results):
             if not any(
                 day_result.directions[DIRECTION_ORDER[index]].selected is not None
-                for index in OPEN_SEA_INDEXES
+                for index in config.direction_indexes
             ):
                 continue
             row = 1 + day_offset
@@ -2814,12 +2954,20 @@ def write_legacy_workbook(
                     "name": f"{config.month}月{day_result.day.day}日",
                     "categories": ["總表", 0, 1, 0, 32],
                     "values": ["總表", row, 1, row, 32],
-                    "line": {"color": palette[day_offset % len(palette)], "width": 0.75, "transparency": 35},
+                    "values_data": [
+                        day_result.directions[direction].selected if index in config.direction_indexes else None
+                        for index, direction in enumerate(DIRECTION_ORDER)
+                    ],
+                    **_radar_series_style(config, palette[day_offset % len(palette)]),
                 }
             )
         radar.set_title({"name": f"{config.year}-{config.month:02d} AIS通訊涵蓋圖"})
         radar.set_legend({"position": "right", "font": {"size": 8}})
         radar.set_size({"width": 760, "height": 480})
+        _configure_radar_axis(
+            radar, config,
+            (day.directions[direction].selected for day in day_results for direction in config.directions),
+        )
         summary.insert_chart(stat_start + 6, 0, radar)
 
         columns = workbook.add_chart({"type": "column"})
@@ -2927,29 +3075,44 @@ def _add_legacy_charts(
     values: dict[tuple[date, str], float | None],
     stat_start: int,
 ) -> None:
-    radar = workbook.add_chart({"type": "radar"})
+    radar = workbook.add_chart(_radar_options(config))
     palette = ["#4472C4", "#ED7D31", "#70AD47", "#A5A5A5", "#FFC000", "#5B9BD5"]
-    for day_offset, day_result in enumerate(day_results):
+    radar_days = [
+        (offset, day_result) for offset, day_result in enumerate(day_results)
+        if config.resolved_radar_style != "filled" or any(
+            values.get((day_result.day, direction)) is not None for direction in config.directions
+        )
+    ]
+    empty_period = not radar_days
+    if empty_period and day_results:
+        # XlsxWriter requires a series, even for a legitimately empty period.
+        # Keep the real worksheet range and blank cache; do not invent zeros.
+        radar_days = [(0, day_results[0])]
+    for day_offset, day_result in radar_days:
         row = 1 + day_offset
         radar.add_series(
             {
-                "name": f"{config.month}月{day_result.day.day}日",
+                "name": "本時段無有效資料" if empty_period else f"{config.month}月{day_result.day.day}日",
                 "categories": ["總表", 0, 1, 0, 32],
                 "values": ["總表", row, 1, row, 32],
-                "line": {
-                    "color": palette[day_offset % len(palette)],
-                    "width": 0.75,
-                    "transparency": 35,
-                },
+                "values_data": [
+                    values.get((day_result.day, direction)) if index in config.direction_indexes else None
+                    for index, direction in enumerate(DIRECTION_ORDER)
+                ],
+                **_radar_series_style(config, palette[day_offset % len(palette)]),
             }
         )
     radar.set_title({"name": f"{config.year}-{config.month:02d} AIS通訊涵蓋圖"})
     radar.set_legend({"position": "right", "font": {"size": 8}})
     radar.set_size({"width": 760, "height": 480})
+    _configure_radar_axis(
+        radar, config,
+        (values.get((day.day, direction)) for day in day_results for direction in config.directions),
+    )
     sheet.insert_chart(stat_start + 6, 0, radar)
 
     helper_column = 34
-    sheet.write(0, helper_column, "海向方位")
+    sheet.write(0, helper_column, "納入方位")
     sheet.write_row(0, helper_column + 1, ["MAX", "MIN", "AVERAGE"])
     stat_values = {
         direction: _stats(
@@ -2957,7 +3120,7 @@ def _add_legacy_charts(
         )
         for direction in DIRECTION_ORDER
     }
-    for helper_row, direction_index in enumerate(OPEN_SEA_INDEXES, start=1):
+    for helper_row, direction_index in enumerate(config.direction_indexes, start=1):
         direction = DIRECTION_ORDER[direction_index]
         sheet.write(helper_row, helper_column, LEGACY_DIRECTION_ABBREVIATIONS[direction_index])
         for offset in range(3):
@@ -2967,7 +3130,7 @@ def _add_legacy_charts(
     sheet.set_column(helper_column, helper_column + 3, None, None, {"hidden": True})
 
     columns = workbook.add_chart({"type": "column"})
-    categories = ["總表", 1, helper_column, len(OPEN_SEA_INDEXES), helper_column]
+    categories = ["總表", 1, helper_column, len(config.direction_indexes), helper_column]
     for label, helper_offset, color in (
         ("最遠距離", 1, "#4472C4"),
         ("最近距離", 2, "#ED7D31"),
@@ -2980,7 +3143,7 @@ def _add_legacy_charts(
                     "總表",
                     1,
                     helper_column + helper_offset,
-                    len(OPEN_SEA_INDEXES),
+                    len(config.direction_indexes),
                     helper_column + helper_offset,
                 ],
                 "fill": {"color": color},
@@ -2996,7 +3159,7 @@ def _add_legacy_charts(
                 "總表",
                 1,
                 helper_column + 3,
-                len(OPEN_SEA_INDEXES),
+                len(config.direction_indexes),
                 helper_column + 3,
             ],
             "line": {"color": "#70AD47", "width": 2.0},
@@ -3033,7 +3196,7 @@ def _write_delivery_summary_sheet(
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             column = 1 + direction_index
             value = values.get((day_result.day, direction))
-            if direction_index not in OPEN_SEA_INDEXES:
+            if direction_index not in config.direction_indexes:
                 sheet.write_blank(row, column, None, number_format)
             elif integrated_formula:
                 excel_row = row + 1
@@ -3053,7 +3216,7 @@ def _write_delivery_summary_sheet(
                 sheet.write_number(row, column, value, number_format)
 
     stat_start = len(day_results) + 2
-    stat_specs = [("MAX", "MAX", 0), ("MIN", "MIN", 1), ("平均值", "AVERAGE", 2), ("標準差", "STDEV.S", 3)]
+    stat_specs = [("MAX", "MAX", 0), ("MIN", "MIN", 1), ("平均值", "AVERAGE", 2), ("標準差", "_xlfn.STDEV.S", 3)]
     stats_by_direction = {
         direction: _stats(values.get((item.day, direction)) for item in day_results)
         for direction in DIRECTION_ORDER
@@ -3063,7 +3226,7 @@ def _write_delivery_summary_sheet(
         sheet.write(row, 0, label, stat_label)
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             column = 1 + direction_index
-            if direction_index not in OPEN_SEA_INDEXES:
+            if direction_index not in config.direction_indexes:
                 sheet.write_blank(row, column, None, number_format)
                 continue
             column_name = _excel_col(column)
@@ -3087,6 +3250,7 @@ def _write_period_full_workbook(
     )
     workbook.use_zip64()
     workbook.set_calc_mode("auto")
+    _write_policy_properties(workbook, config)
     workbook.set_properties(
         {
             "title": f"{config.port} {config.year}年{config.month}月 {scope} 32方位數值",
@@ -3113,13 +3277,15 @@ def _write_period_full_workbook(
             sheet.write_row(0, 0, ["DISTANCE", "DEGREE", "方位"], header_format)
             sheet.write_row(0, 7, DIRECTION_ORDER, header_format)
             for direction_index, direction in enumerate(DIRECTION_ORDER):
-                if direction_index not in OPEN_SEA_INDEXES:
+                if direction_index not in config.direction_indexes:
                     continue
                 final_value = values.get((day_result.day, direction))
                 excel_column = _excel_col(7 + direction_index)
+                # Excel's XLSX format requires the future-function prefix;
+                # without it, recalculation yields #NAME? despite correct cached values.
                 formula = (
                     f'=IF(COUNTIF($C:$C,{excel_column}$1)=0,"",'
-                    f'MAXIFS($A:$A,$C:$C,{excel_column}$1))'
+                    f'_xlfn.MAXIFS($A:$A,$C:$C,{excel_column}$1))'
                 )
                 sheet.write_formula(
                     1,
@@ -3142,7 +3308,7 @@ def _write_period_full_workbook(
                     if record.msg_type not in HISTORICAL_MESSAGE_TYPES or record.period != scope:
                         continue
                     direction = DIRECTION_ORDER[direction_index]
-                    if direction_index in OPEN_SEA_INDEXES:
+                    if direction_index in config.direction_indexes:
                         final_value = values.get((day_result.day, direction))
                         if final_value is None or record.distance > final_value + 1e-12:
                             continue
@@ -3158,7 +3324,7 @@ def _write_period_full_workbook(
                     sheet.write(excel_row, 2, direction)
                     maxima[direction] = max(maxima.get(direction, record.distance), record.distance)
                     excel_row += 1
-            for direction_index in OPEN_SEA_INDEXES:
+            for direction_index in config.direction_indexes:
                 direction = DIRECTION_ORDER[direction_index]
                 final_value = values.get((day_result.day, direction))
                 detail_max = maxima.get(direction)
@@ -3206,6 +3372,7 @@ def _write_summary_workbook(
 ) -> None:
     workbook = xlsxwriter.Workbook(path, {"nan_inf_to_errors": True})
     workbook.set_calc_mode("auto")
+    _write_policy_properties(workbook, config)
     if integrated_inputs is not None:
         for sheet_name, source_values in zip(("Period A", "Period B"), integrated_inputs):
             source = workbook.add_worksheet(sheet_name)
@@ -3262,15 +3429,16 @@ def write_delivery_workbooks(
     period_a = _period_values(config, snapshot, day_results, PERIOD_A)
     period_b = _period_values(config, snapshot, day_results, PERIOD_B)
     integrated = _integrated_period_values(day_results, period_a, period_b)
+    _validate_radar_max(config, integrated.values())
 
     for day_result in day_results:
         for direction_index, direction in enumerate(DIRECTION_ORDER):
             left = period_a.get((day_result.day, direction))
             right = period_b.get((day_result.day, direction))
             actual = integrated.get((day_result.day, direction))
-            if direction_index not in OPEN_SEA_INDEXES:
+            if direction_index not in config.direction_indexes:
                 if any(value is not None for value in (left, right, actual)):
-                    raise AssertionError("陸向交付格必須維持空白")
+                    raise AssertionError("方位政策排除的交付格必須維持空白")
                 continue
             expected = max(value for value in (left, right) if value is not None) if any(
                 value is not None for value in (left, right)
@@ -3389,6 +3557,9 @@ def config_from_review_workbook(
         year=year,
         month=month,
         delivery_dir=delivery_dir,
+        direction_policy=_review_direction_policy(metadata),
+        radar_style=str(metadata.get("Radar style", "")),
+        radar_max=(None if metadata.get("Radar maximum NM") == "auto" else float(metadata.get("Radar maximum NM", "nan"))),
         max_distance=float(metadata.get("Max distance NM", 500.0)),
         tolerance=float(metadata.get("Cluster tolerance", 0.10)),
         cluster_size=int(metadata.get("Cluster size", 3)),
@@ -3640,6 +3811,9 @@ def launch_gui() -> None:
             self.top_var = tk.StringVar(value="50")
             self.workers_var = tk.StringVar(value=str(default_worker_count()))
             self.message_types_var = tk.StringVar(value="1,2,3,18,19")
+            self.direction_policy_var = tk.StringVar(value="auto")
+            self.radar_style_var = tk.StringVar(value="auto")
+            self.radar_max_var = tk.StringVar()
             self.status_var = tk.StringVar(value="請先選擇每日 AIS Excel 所在資料夾。")
             self.progress_text_var = tk.StringVar(value="尚未開始")
 
@@ -3710,6 +3884,17 @@ def launch_gui() -> None:
                 text="只影響 logical-day modern；五份正式交付固定使用 historical 1,3,4,18,19。",
                 foreground="#5B6573",
             ).grid(row=4, column=2, columnspan=3, sticky="w", padx=(12, 0))
+            ttk.Label(config_box, text="方位政策").grid(row=5, column=0, sticky="w", pady=(8, 0))
+            ttk.Combobox(config_box, textvariable=self.direction_policy_var, values=DIRECTION_POLICIES,
+                         state="readonly", width=12).grid(row=6, column=0, sticky="w")
+            ttk.Label(config_box, text="雷達圖樣式").grid(row=5, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
+            ttk.Combobox(config_box, textvariable=self.radar_style_var, values=RADAR_STYLES,
+                         state="readonly", width=12).grid(row=6, column=1, sticky="w", padx=(10, 0))
+            ttk.Label(config_box, text="雷達刻度上限 NM（留空自動）").grid(row=5, column=2, columnspan=3, sticky="w", padx=(10, 0), pady=(8, 0))
+            ttk.Entry(config_box, textvariable=self.radar_max_var, width=12).grid(row=6, column=2, sticky="w", padx=(10, 0))
+            ttk.Label(config_box,
+                      text="auto：KLNG 使用歷史 21 方位＋線形；其他港別全部 32 方位＋填色。all32 不套地理遮罩，非已驗證海向政策。刻度不影響距離篩選。",
+                      foreground="#5B6573", wraplength=820).grid(row=7, column=0, columnspan=5, sticky="w", pady=(5, 0))
 
             run_box = ttk.LabelFrame(container, text="3  一鍵執行", style="Section.TLabelframe")
             run_box.grid(row=2, column=0, sticky="nsew")
@@ -3909,6 +4094,9 @@ def launch_gui() -> None:
                 year=year,
                 month=month,
                 max_distance=float(self.max_distance_var.get()),
+                direction_policy=self.direction_policy_var.get(),
+                radar_style=self.radar_style_var.get(),
+                radar_max=float(self.radar_max_var.get()) if self.radar_max_var.get().strip() else None,
                 tolerance=float(self.tolerance_var.get()) / 100.0,
                 cluster_size=int(self.cluster_var.get()),
                 top_candidates=int(self.top_var.get()),
@@ -3952,6 +4140,8 @@ def launch_gui() -> None:
             fragment_count = sum(len(day_input.fragments) for day_input in job.days)
             self.append_log(f"Logical days: {source_count}")
             self.append_log(f"Source fragments: {fragment_count}")
+            self.append_log(config.direction_policy_description)
+            self.append_log(f"Radar: {config.resolved_radar_style}; maximum NM: {config.radar_max if config.radar_max is not None else 'auto'}")
             self.append_log(f"Modern analysis：{config.output_path}")
             self.append_log(f"正式五檔：{delivery.root}")
 
@@ -4176,6 +4366,9 @@ def cli_progress(payload: dict) -> None:
         print(f"Period: {payload['year']}-{int(payload['month']):02d}", flush=True)
         print(f"Logical days: {payload['source_count']}", flush=True)
         print(f"Source fragments: {payload['fragment_count']}", flush=True)
+        if "direction_policy" in payload:
+            print(f"Direction policy: {payload['direction_policy']}", flush=True)
+            print(f"Radar: {payload['radar_style']}; maximum NM: {payload['radar_max'] if payload['radar_max'] is not None else 'auto'}", flush=True)
     elif kind == "file_start":
         print(f"[{payload['position']}/{payload['total']}] {payload['file']}", flush=True)
     elif kind == "rows":
@@ -4211,6 +4404,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--year", type=int, help="可省略；預設從固定格式檔名自動判定")
     parser.add_argument("--month", type=int, help="可省略；預設從固定格式檔名自動判定")
     parser.add_argument("--max-distance", type=float, default=500.0)
+    parser.add_argument("--direction-policy", choices=DIRECTION_POLICIES,
+                        help="auto: KLNG=klng21，其他=all32；all32 不套地理遮罩，非已驗證海向政策")
+    parser.add_argument("--radar-style", choices=RADAR_STYLES,
+                        help="auto: KLNG 線形，其他港別填色；可指定 line 或 filled")
+    parser.add_argument("--radar-max", type=float,
+                        help="雷達圖刻度上限 NM；省略為 Excel 自動刻度，低於有效值會拒絕輸出，不改距離篩選")
     parser.add_argument("--tolerance", type=float, default=10.0, help="百分比，例如 10")
     parser.add_argument("--cluster-size", type=int, default=3)
     parser.add_argument("--top-candidates", type=int, default=50)
@@ -4245,6 +4444,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.month,
             arguments.max_days,
             arguments.max_files,
+            arguments.direction_policy,
+            arguments.radar_style,
+            arguments.radar_max,
         )
     ):
         launch_gui()
@@ -4263,6 +4465,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.month,
                 arguments.max_days,
                 arguments.max_files,
+                arguments.direction_policy,
+                arguments.radar_style,
+                arguments.radar_max,
             )
         ):
             parser.error("--finalize-from 不可與來源分析參數並用")
@@ -4307,6 +4512,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         month=month,
         delivery_dir=delivery_dir,
         max_distance=arguments.max_distance,
+        direction_policy=arguments.direction_policy or "auto",
+        radar_style=arguments.radar_style or "auto",
+        radar_max=arguments.radar_max,
         tolerance=arguments.tolerance / 100.0,
         cluster_size=arguments.cluster_size,
         top_candidates=arguments.top_candidates,

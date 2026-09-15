@@ -1,11 +1,23 @@
-AIS 32 方位月報一鍵製作 v1.5.1
+AIS 32 方位月報一鍵製作 v1.5.2
 =================================
 
-【v1.5.1 中文方向名稱與升級】
+【v1.5.2 方位排除修正】
+方位設定 auto：KLNG 維持原21方位，HWLN及其他站點採all32，不套KLNG地理排除。
+all32表示保留32方位有效結果，不表示已證明32個方向全是海域。
+可明確選擇klng21或all32；沒有資料的方位仍留白，不補0。
+雷達樣式auto：KLNG維持線形，其他站點使用填色；亦可自行選line或filled。
+雷達刻度上限留白表示自動。自訂上限不能小於圖中有效數值，避免裁切資料。
+選值距離上限300/500 NM與雷達圖刻度是不同設定。
+cache version 6、review schema AIS_V15_REVIEW_3；舊覆核檔請由原始資料重新分析、覆核。
+原始AIS、舊工作簿不會因升級而自動改寫。請為重製成果使用新的輸出目錄。
+另修正MAXIFS、STDEV.S的Excel公式儲存格式，避免重算後#NAME?被隱藏成空白。
+填色圖只列實際有數值的日期系列，缺資料日期仍保留在表格及缺日紀錄中。
+
+【v1.5.1 歷史名稱修正】
 32 方位中文名稱採中文維基百科〈羅盤方位〉表的「中文名」欄，不採「又名」欄。
 https://zh.wikipedia.org/zh-tw/羅盤方位
 SEbE = 東南微東、SEbS = 東南微南；英文縮寫、bearing 分箱與研究數值不變。
-北至東南偏東、西南偏西至北微西，共 21 方位。
+KLNG歷史設定：北至東南偏東、西南偏西至北微西，共21方位。
 cache version 升為 5，舊 cache 安全失效；normalized spool version 維持 1。
 review schema 升為 AIS_V15_REVIEW_2。v1.5.0 覆核 workbook 不相容：
 請由原始月份資料重新分析並覆核，避免 decision direction 錯置，不提供自動 migration。
@@ -47,7 +59,7 @@ Period 依每列實際時間定義，與檔名尾碼無關：
 - Period B：12:00:00 <= time < 24:00:00
 
 五檔固定契約：
-- Period detail MAX = Period final（21 海向）
+- Period detail MAX = Period final（依選定21或32方位）
 - Period 小總表 = 對應大 workbook 總表
 - Integrated = MAX(Period A final, Period B final)
 - 統計與圖表每次由當下 grid 重算

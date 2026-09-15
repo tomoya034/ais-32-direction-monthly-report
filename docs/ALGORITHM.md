@@ -1,4 +1,4 @@
-# v1.5.1 數值、覆核與工作簿契約
+# v1.5.2 數值、覆核與工作簿契約
 
 ## 1. Source fragment 與 logical day
 
@@ -55,7 +55,9 @@ bearing 正規化至 `[0, 360)`，以每 11.25 度一格、floor-bin 映射 32 �
 
 中文方向名稱來源為中文維基百科[〈羅盤方位〉](https://zh.wikipedia.org/zh-tw/羅盤方位)表的「中文名」欄，不採「又名」欄。v1.5.1 只修正十個中文 label，包括 SEbE = 東南微東、SEbS = 東南微南；32 個 index、英文縮寫、bearing 分箱與研究數值不變。
 
-北至東南偏東、西南偏西至北微西，共 21 方位；`OPEN_SEA_INDEXES` 固定為 index `0..10 + 22..31`，中間 11 個陸向的 final grid 保持空白。
+方位政策獨立於訊息 profile。`direction_policy=auto` 對 KLNG 解析為 `klng21`（index `0..10 + 22..31`），其他站點解析為 `all32`（index `0..31`）。可由 CLI／GUI 明確指定。
+
+`klng21` 延續 KLNG 歷史排除；不適用的 11 方位 final grid 保持空白。`all32` 不套用地理方向排除，32 方位均可覆核及交付，但無有效候選仍留白。不能把 `all32` 說成已證明 HWLN 或任意新站全部方向都屬海域，也不能把舊固定空白解釋為零 AIS。
 
 ### Modern research
 
@@ -73,7 +75,7 @@ bearing 正規化至 `[0, 360)`，以每 11.25 度一格、floor-bin 映射 32 �
 
 ## 5. 完整群聚 selector
 
-對每個 scope 與海向：
+對每個 scope 與選定方位：
 
 1. 套用該 scope 的 message profile 與設定的距離上限（預設 500 NM）。
 2. 距離由高至低排列，穩定來源順序只用於同距離 tie-break。
@@ -81,7 +83,7 @@ bearing 正規化至 `[0, 360)`，以每 11.25 度一格、floor-bin 映射 32 �
 4. 第一個至少含 3 筆的 window，其最高值即自動值。
 5. 若找不到群聚，保留最高有效值並標示待複核；完全無合格列則留白。
 
-西南偏西、西微南、西的值高於 10 NM 時另列風險。`top_candidates` 只截取顯示清單；完整 selector 永遠搜尋全部合格列，且是否 renderer 五檔不得改變 selected、rank 或 cluster count。
+`klng21` 的西南偏西、西微南、西值高於 10 NM 時另列原有沿岸風險；此站點警示不套用 `all32`。`top_candidates` 只截取顯示清單；完整 selector 永遠搜尋全部合格列，且是否 renderer 五檔不得改變 selected、rank 或 cluster count。
 
 ## 6. Candidate provenance 與 decision ledger
 
@@ -94,7 +96,9 @@ finalization 會驗證 workbook schema、公式、decision row count、港別／
 
 v1.5.1 將 `CACHE_VERSION` 從 4 升至 5，使舊中文 direction keys 的 cache 安全失效。`NORMALIZED_SPOOL_VERSION` 維持 1，binary 中的 numeric index 語意不變。`REVIEW_WORKBOOK_SCHEMA` 升至 `AIS_V15_REVIEW_2`；兩個覆核讀取入口都拒絕 v1.5.0 的 `AIS_V15_REVIEW_1`，並要求由原始月份資料重新分析、覆核，避免 decision direction 錯置。不實作舊 workbook 自動 migration。
 
-對 21 個可覆核海向，blank period decision 表示該 period final 留白，renderer 不保留該方位 detail rows，以維持 detail MAX 契約。11 個陸向是結構性空白，其明細不是人工 decision scope。
+v1.5.2 為 `CACHE_VERSION=6`、`REVIEW_WORKBOOK_SCHEMA=AIS_V15_REVIEW_3`。方位政策納入設定身分及覆核驗證，舊覆核檔須重新分析，避免 HWLN 的舊 21 方位台帳被默認為已覆核 32 方位。Normalized spool 的分箱語意維持不變。
+
+對政策選定的 21 或 32 方位，blank period decision 表示該 period final 留白，renderer 不保留該方位 detail rows，以維持 detail MAX 契約。只有 `klng21` 排除的 11 方位屬結構性空白；`all32` 的全部方向均為 decision scope。
 
 ## 7. 五份正式 Historical delivery
 
@@ -102,8 +106,8 @@ v1.5.1 將 `CACHE_VERSION` 從 4 升至 5，使舊中文 direction keys 的 cach
 
 固定契約：
 
-1. 21 海向的 `MAX(retained detail rows) = period final`。
-2. blank period final 不保留該海向 rows。
+1. 政策選定方位的 `MAX(retained detail rows) = period final`。
+2. blank period final 不保留該方位 rows。
 3. 小總表 B:AG 日值 grid 等於對應大 workbook 的總表。
 4. 第五份每格 `Integrated = MAX(Period A final, Period B final)`；兩者皆空才空白。
 5. MAX、MIN、AVERAGE、STDEV、雷達圖及 MAX/MIN/AVERAGE 統計圖全部由當次 grid 重算。
@@ -113,6 +117,12 @@ Modern logical-day union-first selection 與 `MAX(period selections)` 並不具�
 寫檔時先完成五個 `.building.xlsx`，再備份舊五檔並整組 promote。任一步驟失敗會清除新檔並復原原 snapshot；若程式崩潰留下新舊並存的 rollback 狀態，下次執行會停止要求人工確認，避免混合月份成果。
 
 每張工作表最多 1,048,576 列，扣除標題後明細上限為 1,048,575。超限在正式發布前報錯；v1.5.1 不截斷，也不自動 split。
+
+### 雷達圖與選值上限
+
+全部雷達均引用 32 欄 B:AG；方位政策決定哪幾欄可以有值，缺值不補 0。`radar_style=auto` 對 KLNG 使用既有線形，其他站點使用填色；可明確指定 line／filled。
+
+`radar_max` 只影響圖表刻度，預設留白使用自動尺度；指定時不得裁掉該圖要呈現的有效數值。它不篩選資料。`max_distance` 是 selector 上限（預設 500 NM），不是雷達軸上限。參考照片的 150、300 不構成所有月份必須固定該刻度的研究規則。
 
 ## 8. Golden regression 邊界
 

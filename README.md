@@ -1,18 +1,29 @@
 # AIS 32 方位月報一鍵製作
 
 [![Tests](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml/badge.svg)](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v1.5.1-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.1)
+[![Release](https://img.shields.io/badge/release-v1.5.2-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.2)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 離線讀取 `D&TMOK <PORT>_YYYYMMDD_*.xlsx`，把同港別、同日期的任意數量檔案視為同一個 logical day，再一次產生 Modern research 分析及五份正式 Historical delivery 工作簿。檔名尾碼只供追溯，不代表固定來源或時段；程式不使用雲端 API，也不會上傳 AIS 資料。
 
-> 目前版本為 `1.5.1`。程式會自動完成目前月份工作流程，但 AIS 異常的研究判斷仍需由領域人員在唯一的 decision ledger 覆核。
+> 目前版本為 `v1.5.2`，修正 HWLN 沿用 KLNG 排除方向及 Excel 重新計算後部分總表變空白的問題。AIS 異常的研究判斷仍需在唯一的 decision ledger 覆核。
+
+## 1.5.2：站點方位與雷達圖
+
+- 方位設定 `auto`：KLNG 保留原 21 方位；HWLN 和其他站點採 `all32`，讓全部 32 方位的有效結果進入總表。這是「不套地理排除」的設定，不是已驗證各站 32 方位全屬海域。
+- 可明確指定 `--direction-policy klng21` 或 `--direction-policy all32`。設定會進入快取與覆核身分驗證，不會把舊 21 方位台帳當成已完整覆核的 32 方位結果。
+- 雷達圖 `--radar-style auto`：KLNG 使用原線形；其他站點使用填色。可另選 `line` 或 `filled`。
+- 雷達圖刻度預設自動；`--radar-max` 可指定上限，但不得小於要呈現的有效數值。`--max-distance` 是選值距離上限，與雷達圖刻度不同，兩者單位均為 NM。
+- 缺乏有效資料仍留白，不補 0。訊息集合、11.25° floor-bin、500 NM 預設選值上限、10%／3 筆群聚、Period A/B 和整合規則未改。
+- Cache version 為 6，review schema 為 `AIS_V15_REVIEW_3`。舊覆核工作簿須重新分析及覆核，不能直接套入新設定。
+
+升級及操作詳見 [`docs/HWLN_STATION_FIX.md`](docs/HWLN_STATION_FIX.md)。
 
 ![AIS 32 方位月報工具視窗](docs/images/app-window.png)
 
 ## 📥 下載與標準流程
 
-1. 從 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.1.zip`。
+1. 從 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.2.zip`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇原始月份資料夾；工具會從檔名辨識港別與年月。
 4. 按「開始全自動製作」。第一次執行會產生一份 Modern 分析與五份正式成果。
@@ -71,16 +82,16 @@ Period 是依每列實際時間切分，與 `_11`、`_23` 或其他尾碼無關�
 
 五檔固定維持以下可驗證契約：
 
-- `Period detail MAX = Period final`（21 個海向；period final 留白時不保留該海向明細）。
+- `Period detail MAX = Period final`（依選定的 21／32 方位設定；period final 留白時不保留該方位明細）。
 - `Period 小總表 = 對應大 workbook 的總表`。
 - `Integrated = MAX(Period A final, Period B final)`。
 - 統計與兩張圖一律由本次 grid 重算，不複製舊 workbook 的過期統計值。
 
 Modern logical-day final 與 Historical integrated 是兩種不同語意；因為群聚選值是非線性運算，前者不保證等於後者。
 
-32 方位中文名稱採中文維基百科[〈羅盤方位〉](https://zh.wikipedia.org/zh-tw/羅盤方位)表的「中文名」欄，不採「又名」欄。英文縮寫與 11.25° floor-bin index 不變；海向仍為「北至東南偏東、西南偏西至北微西，共 21 方位」。
+32 方位中文名稱採中文維基百科[〈羅盤方位〉](https://zh.wikipedia.org/zh-tw/羅盤方位)表的「中文名」欄，不採「又名」欄。英文縮寫與 11.25° floor-bin index 不變。`klng21` 為「北至東南偏東、西南偏西至北微西，共 21 方位」；`all32` 不排除任何方位。
 
-v1.5.1 的 cache version 為 5、review schema 為 `AIS_V15_REVIEW_2`；舊 cache 安全失效。v1.5.0 覆核 workbook 不相容，請由原始月份資料重新分析及覆核，以避免 decision direction 錯置；不提供自動 migration。Index-based normalized spool version 維持 1。
+目前 cache version 為 6、review schema 為 `AIS_V15_REVIEW_3`；舊 cache 安全失效。v1.5.1 及更舊的覆核 workbook 不相容，請由原始月份資料重新分析及覆核，以避免方向名稱或方位政策錯置；不提供自動 migration。Index-based normalized spool version 維持 1。
 
 ## 🧭 兩套 profile 與覆核契約
 
@@ -105,9 +116,9 @@ v1.5.1 的 cache version 為 5、review schema 為 `AIS_V15_REVIEW_2`；舊 cach
 ## 💾 快取、容量與失敗保護
 
 - 每完成一個 logical day 就保存帶來源簽章與 checksum 的結果及 normalized spool；來源 metadata、分析設定或 cache/spool schema 變更時，對應日會安全重算。
-- 目前採每個 logical day 串流讀取後，以 bounded worker 數進行記憶體內 compact sorting；實測六月最高量日仍在可接受資源內，因此 v1.5.1 不加入 external merge 複雜度。
+- 目前採每個 logical day 串流讀取後，以 bounded worker 數進行記憶體內 compact sorting；此設計沿用 v1.5.1 的六月最高量日驗證結果，尚未加入 external merge。
 - 五份成果先全部寫入 `.building.xlsx`，成功後才整組替換；替換失敗會復原原有五檔。
-- 每張 Excel 明細最多 `1,048,575` 筆資料列；超限會在發布前停止，絕不截斷。v1.5.1 不提供 split 模式。
+- 每張 Excel 明細最多 `1,048,575` 筆資料列；超限會在發布前停止，絕不截斷。目前不提供 split 模式。
 - 失敗時會保留已驗證的每日快取，並在輸出資料夾建立 `AIS月報_錯誤報告_*.txt`。
 
 ## ⌨️ 命令列

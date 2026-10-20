@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ais-32-direction-monthly-report"
-version = "1.5.2"
+version = "1.5.6"
 description = "Offline Windows tool for multi-fragment AIS 32-direction analysis and contracted monthly Excel delivery."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,4 +32,4 @@ classifiers = [
 ais-32-direction-monthly-report = "ais_monthly_app:main"
 
 [tool.setuptools]
-py-modules = ["ais_monthly_app"]
+py-modules = ["ais_monthly_app", "ais_source_preflight"]

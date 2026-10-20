@@ -1,18 +1,57 @@
 # AIS 32 方位月報一鍵製作
 
 [![Tests](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml/badge.svg)](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v1.5.2-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.2)
+[![Public release](https://img.shields.io/badge/public_release-v1.5.6-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-離線讀取 `D&TMOK <PORT>_YYYYMMDD_*.xlsx`，把同港別、同日期的任意數量檔案視為同一個 logical day，再一次產生 Modern research 分析及五份正式 Historical delivery 工作簿。檔名尾碼只供追溯，不代表固定來源或時段；程式不使用雲端 API，也不會上傳 AIS 資料。
+離線讀取 `D&TMOK <PORT>_YYYYMMDD_*.xlsx`（亦相容既有個位日期 `YYYYMMd`），把同港別、同日期的任意數量檔案視為同一個 logical day，再一次產生 Modern research 分析及五份正式 Historical delivery 工作簿。檔名尾碼只供追溯，不代表固定來源或時段；程式不使用雲端 API，也不會上傳 AIS 資料。
 
-> 目前版本為 `v1.5.2`，修正 HWLN 沿用 KLNG 排除方向及 Excel 重新計算後部分總表變空白的問題。AIS 異常的研究判斷仍需在唯一的 decision ledger 覆核。
+> 正式交付版為 `v1.5.6`：直接採用完整回歸通過的 r2 EXE，未重新 build。已完成 2026 全量雙跑、2024 六個安全月、負向來源測試，以及桌面部署後 HWLN 2026/04、2026/06 實機驗收。AUTO、message profiles、A/B、500 NM 與32方位分箱不變；AUTO 等同人工研究判讀仍未被證明。正式驗證範圍及升級限制見 [`v1.5.6 Release Notes`](docs/RELEASE_V1.5.6.md)；過往 local 版本章節是歷史紀錄，以本版說明為準。
+
+## 1.5.6：Source Preflight 與 CLI hardening
+
+- 正常分析及覆核重生前，先逐列做來源安全預檢；JSON 與人讀摘要各自保存，沒有來源轉換或靜默排除。
+- 以欄位名稱及 worksheet 結構辨識 schema，記錄欄序／改名變體。GPS_* 可辨識但不自動 alias；mixed-date、缺欄、未知／重複必要欄位阻擋整月。
+- 缺日／不完整月與 partial-day 指標明確警告；來源 cache 只對應來源日，完整日曆的缺日保持空白。
+- 完整重複、normalized core overlap／subset 先阻擋。`SUBSET_CANDIDATE` 不是自動排除授權；須保留來源 SHA、包含證據及排除 manifest，另建安全輸入 view。
+- CLI 失敗回傳非零、持久保存 `AIS32_CLI_FAILURE_*.json` 並嘗試寫 stderr，不再把 SourceFileError 送到 packaged windowed bootloader 的互動對話框。GUI 仍使用可理解的錯誤訊息及相同錯誤分類。
+
+只盤點來源（不建立 Excel、不改來源），報告資料夾必須是新路徑且在來源外：
+
+```powershell
+.\AIS_32方位月報工具.exe --input "D:\AIS資料\2024" --preflight-only --recursive --workers 3 --preflight-report "D:\AIS驗證\2024_preflight_001"
+```
+
+報告包含 `SOURCE_PREFLIGHT_REPORT.json` 與 `SOURCE_PREFLIGHT_SUMMARY.md`。SAFE 只認證本次來源快照，不代表數值／研究成果已獲核准；BLOCKED 回傳非零且不進入正式處理。正常分析會自動預檢，不必改變原本操作方式。若原輸出位置在來源資料夾內，新增預檢報告改放獨立暫存位置，避免增加來源 sidecar。
+
+## 1.5.5：輸出安全修復候選
+
+- 開始前檢查 Modern 與五份正式成果的最終／暫存路徑，拒絕相互碰撞或與 AIS 原始來源相撞。
+- 以程序鎖保護共用的輸出、cache 和 normalized spool；第二個程序遇到相同資源會明確停止。鎖位於使用者暫存目錄，不寫入原始 AIS 資料夾。
+- 首次分析的 Modern 與五份 Historical 先完成整組建置，再一起替換；中途出錯會還原原有六份成果，避免新台帳配舊表格。
+- 補強 source/copy verifier 的 checkpoint 身分、錯誤重試、原子儲存及 fresh/resume 計數，並加入不共用 production parser／方位函式的獨立來源稽核。
+- 目前修復與全量驗證紀錄見 `docs/FULL_REGRESSION_20261007.md`；未完成項目保留 `UNVERIFIED`。
+
+## 1.5.4：結案後全量回歸修復版
+
+- 接受 `YYYYMMd` 個位日期檔名，修正 HWLN 2026-04-01 至 04-09 被靜默忽略；看似 AIS 原始檔但日期／格式不可解析時改為 fail closed。
+- Historical 雷達圖預設改為六月確認成果的 filled radar、30 色 Office palette 與 60% transparency；統計圖回復青色 MAX、橙色 MIN、紅色 2.25 pt AVG line。
+- 圖表尺寸、位置、Plot Area、軸線／格線、圖例與標題依六月 reference 契約調整；KLNG 統計圖以正確 hidden helper 重現 `WSW..NbW, N..ESE` 視覺順序，B:AG 資料順序不變，也不沿用 reference 的舊錯位 range。
+- 新增全來源盤點、全量執行、reference grid、OOXML、Excel-native 與 deterministic package regression 工具。
+
+## 1.5.3：本機驗證修復版
+
+- Period A/B 大 workbook 的「總表」改為逐列完成 AI:AL helper cells，維持 `constant_memory` 低記憶體模式；五份 Historical Chart 2 都寫入連續 chart cache，helper 缺值仍維持空白。
+- Modern、legacy 與 Historical 總表的跨表引用及 MAX/MIN/AVERAGE/STDEV.S 公式加入 COUNT guard；Excel 原生重算後缺值不會被轉成 0。
+- Modern、Historical Period A、Historical Period B 與 A/B 整合圖表標題明確標示 scope，避免把不同 profile／period 的圖誤認為同一結果。
+- 非 byte-identical fragments 若含 exact normalized core duplicate，或 overlap audit 超過 250,000 筆而無法證明安全，會停止整月且不建立／替換正式檔；不做 silent dedupe。
+- Cache version 為 7，強制 cache 6 失效並重掃原始 fragments。Normalized spool version 1 與 review schema `AIS_V15_REVIEW_3` 不變。
 
 ## 1.5.2：站點方位與雷達圖
 
 - 方位設定 `auto`：KLNG 保留原 21 方位；HWLN 和其他站點採 `all32`，讓全部 32 方位的有效結果進入總表。這是「不套地理排除」的設定，不是已驗證各站 32 方位全屬海域。
 - 可明確指定 `--direction-policy klng21` 或 `--direction-policy all32`。設定會進入快取與覆核身分驗證，不會把舊 21 方位台帳當成已完整覆核的 32 方位結果。
-- 雷達圖 `--radar-style auto`：KLNG 使用原線形；其他站點使用填色。可另選 `line` 或 `filled`。
+- 雷達圖 `--radar-style auto`：依六月確認成果使用填色。可另選 `line` 或 `filled`。
 - 雷達圖刻度預設自動；`--radar-max` 可指定上限，但不得小於要呈現的有效數值。`--max-distance` 是選值距離上限，與雷達圖刻度不同，兩者單位均為 NM。
 - 缺乏有效資料仍留白，不補 0。訊息集合、11.25° floor-bin、500 NM 預設選值上限、10%／3 筆群聚、Period A/B 和整合規則未改。
 - Cache version 為 6，review schema 為 `AIS_V15_REVIEW_3`。舊覆核工作簿須重新分析及覆核，不能直接套入新設定。
@@ -23,7 +62,7 @@
 
 ## 📥 下載與標準流程
 
-1. 從 [GitHub Releases](https://github.com/tomoya034/ais-32-direction-monthly-report/releases) 下載 `AIS_32_Direction_Monthly_Report_v1.5.2.zip`。
+1. Windows 執行版請下載 [GitHub Releases v1.5.6](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6) 的 `AIS_32_Direction_Monthly_Report_v1.5.6.zip`，並核對附上的 `SHA256SUMS.txt`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇原始月份資料夾；工具會從檔名辨識港別與年月。
 4. 按「開始全自動製作」。第一次執行會產生一份 Modern 分析與五份正式成果。
@@ -40,6 +79,7 @@
 
 ```text
 D&TMOK <PORT>_YYYYMMDD_*.xlsx
+D&TMOK <PORT>_YYYYMMd_*.xlsx   # 既有個位日期相容格式
 ```
 
 例如：
@@ -91,7 +131,7 @@ Modern logical-day final 與 Historical integrated 是兩種不同語意；因�
 
 32 方位中文名稱採中文維基百科[〈羅盤方位〉](https://zh.wikipedia.org/zh-tw/羅盤方位)表的「中文名」欄，不採「又名」欄。英文縮寫與 11.25° floor-bin index 不變。`klng21` 為「北至東南偏東、西南偏西至北微西，共 21 方位」；`all32` 不排除任何方位。
 
-目前 cache version 為 6、review schema 為 `AIS_V15_REVIEW_3`；舊 cache 安全失效。v1.5.1 及更舊的覆核 workbook 不相容，請由原始月份資料重新分析及覆核，以避免方向名稱或方位政策錯置；不提供自動 migration。Index-based normalized spool version 維持 1。
+目前 cache version 為 7、review schema 為 `AIS_V15_REVIEW_3`；舊 cache 安全失效。cache 7 會強制重掃原始 fragments 並執行 overlap safety gate；v1.5.1 及更舊的覆核 workbook 不相容，請由原始月份資料重新分析及覆核，以避免方向名稱或方位政策錯置；不提供自動 migration。Index-based normalized spool version 維持 1。
 
 ## 🧭 兩套 profile 與覆核契約
 
@@ -108,7 +148,8 @@ Modern logical-day final 與 Historical integrated 是兩種不同語意；因�
 - 同港同日的所有 fragments 都會納入；排序不依賴 mtime、尾碼或檔案列舉順序。
 - byte-identical 檔案只處理一次，其他路徑記為 alias。
 - time-range overlap、occupied-second overlap、正常同秒不同訊息、possible duplicate event 與 normalized-core 相同紀錄分開報告。
-- timestamp 或 occupied second 相同不等於 duplicate；非 byte-identical fragments 在缺乏領域 dedupe key 前不會被靜默去重。
+- timestamp 或 occupied second 相同不等於 duplicate；可完整稽核且沒有 exact normalized core duplicate 時仍合併處理，也不會把 possible duplicate event 靜默去重。
+- 非 byte-identical fragments 若含 exact normalized core duplicate，或 cross-fragment audit 超過 250,000 筆上限而無法證明安全，整個月份會在正式檔建立／替換前停止。錯誤會列出兩個檔名；請移除重複檔，或另建只含已確認互補 fragments 的安全來源資料夾後重跑。
 - 損壞 XLSX、缺少正式 provenance 欄位、列內日期不符檔名 logical day 或 spool checksum 不符會阻擋正式輸出。
 
 程式不建立合併後的巨大來源 Excel。每個 logical day 會建立 profile-neutral normalized spool，保留 East、核心欄位有效的必要資料、`msg_type`、時間與 provenance，也保留超過 500 NM 的列；500 NM 只在 selector／renderer 階段套用。

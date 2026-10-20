@@ -1,17 +1,27 @@
-# v1.5.2 數值、覆核與工作簿契約
+# v1.5.6 來源安全、數值、覆核與工作簿契約
+
+## 0. Source Preflight（不改選值）
+
+正式分析／覆核重生前先完整串流檢查來源，以名稱辨識必要欄位並保存實際欄序、header fingerprint、來源 SHA、逐列日期分布及跨檔 normalized core 多重集合證據。GPS_* 只作鑑識式日期讀取，沒有研究語義等價授權，必須阻擋；不得當作標準時間 alias。
+
+Mixed-date、未知／缺欄／重複必要欄位、損壞 workbook、exact core 重疊或 subset，以及既有 overlap audit 上限未通過，均阻擋整月。缺日／部分日是揭露的警告，非補值依據。SAFE 只表示本次來源身分符合契約；處理完成後再驗來源身分，變更時不得建立或替換正式成果。
+
+完整重複／subset 由 preflight 先阻擋，沒有自動 dedupe 或排除。`SUBSET_CANDIDATE` 明確表示只證明 normalized required-field 多重集合包含（含重複次數），不是所有未使用欄位相同；排除須另留 manifest／SHA／完整證據並建立安全 view。高 occupied-second 重疊只作描述性指標，本身不等同重複訊息；不同 AIS 事件可互補，完全相同 normalized core 則不會默默加總。
+
+JSON 與人讀摘要不寫進原始來源資料夾。Source days 與 calendar days 分開：cache 只對應真正來源日，完整日曆缺日的表格、ledger、helper 與 retained detail 必須保持無來源的空白／零列。本輪 selector／分箱／profiles／period／cap 均未修改。
 
 ## 1. Source fragment 與 logical day
 
-來源檔名格式為 `D&TMOK <PORT>_YYYYMMDD_<opaque suffix>.xlsx`。識別鍵只有港別與日期；同一鍵下的 1、2、3 或更多檔案都是同一個 logical day 的 fragments。
+來源檔名格式為 `D&TMOK <PORT>_YYYYMMDD_<opaque suffix>.xlsx`；為相容 HWLN 2026-04-01 至 04-09 的既有命名，也接受個位日期 `YYYYMMd`。7 位日期一律解析為四位年、兩位月、一位日，不猜測其他切法。識別鍵只有港別與日期；同一鍵下的 1、2、3 或更多檔案都是同一個 logical day 的 fragments。看似 `D&TMOK` AIS 檔卻無法解析時停止，不再靜默跳過。
 
 - suffix 只保留供 provenance 顯示，不解讀為來源、班次或固定片數。
 - 所有 fragments 以內容 hash 建立穩定身分；mtime、suffix 與檔案列舉順序不影響 selector。
-- SHA-256 完全相同的檔案只處理一份，其餘路徑記為 aliases。
+- 正式月份入口先由 preflight 阻擋 SHA-256 完全相同的來源檔，要求明確的安全 view；底層相容 reader 的 aliases 表示法保留，但不作正常流程的自動排除授權。
 - 每列儲存日期必須等於檔名日期；錯日、無效時間、損壞 workbook 或缺少必要 schema 會阻擋該月正式輸出。
 
-## 2. 單次讀取與 normalized spool
+## 2. 正規化處理與 normalized spool
 
-每個 canonical fragment 以 openpyxl read-only 串流讀取一次。必要欄位為 Year、Month、Day、Hour、Minute、Second、channel、msg_type、mmsi、LONGITUDE_DESC、bearing 與 distance in nautical miles。
+預檢與正式正規化是不同階段，各自完整串流讀取；預檢不產生供 selector 使用的 spool。正式正規化中，每個 canonical fragment 以 openpyxl read-only 串流讀取一次。必要欄位為 Year、Month、Day、Hour、Minute、Second、channel、msg_type、mmsi、LONGITUDE_DESC、bearing 與 distance in nautical miles。
 
 profile-neutral spool 保存以下 normalized rows：
 
@@ -47,7 +57,7 @@ spool 不先套 Modern 或 Historical message profile，也不先刪除超過 50
 5. exact normalized core records：同秒、msg_type、MMSI、channel、bearing、distance 均相同。
 6. byte-identical duplicate files：整檔 SHA-256 相同。
 
-時間範圍重疊不表示實際資料重疊；若 occupied-second 集合沒有交集，就安全短路，不做 cross-fragment row audit。相同 timestamp 也可能是合法的不同 AIS 訊息。v1.5.1 只對 byte-identical files 合併處理；其他情形只診斷、不 silent dedupe。
+時間範圍重疊不表示實際資料重疊；若 occupied-second 集合沒有交集，就安全短路，不做 cross-fragment row audit。相同 timestamp 也可能是合法的不同 AIS 訊息。byte-identical files 只處理一次；可完整稽核且 exact normalized core records 為 0 的非同檔 fragments 照常合併，不對 possible duplicate events 做 silent dedupe。若 exact normalized core records 大於 0，或 audit 超過 250,000 筆上限而無法證明安全，整個月份會在正式檔建立／替換前停止，並要求移除重複檔或改用只含已確認互補 fragments 的安全來源資料夾。
 
 ## 4. 方位與兩套 profile
 
@@ -98,6 +108,8 @@ v1.5.1 將 `CACHE_VERSION` 從 4 升至 5，使舊中文 direction keys 的 cach
 
 v1.5.2 為 `CACHE_VERSION=6`、`REVIEW_WORKBOOK_SCHEMA=AIS_V15_REVIEW_3`。方位政策納入設定身分及覆核驗證，舊覆核檔須重新分析，避免 HWLN 的舊 21 方位台帳被默認為已覆核 32 方位。Normalized spool 的分箱語意維持不變。
 
+v1.5.3 將 `CACHE_VERSION` 升為 7，讓 cache 6 必定失效並從原始 fragments 重掃，避免舊 DayResult 繞過 exact-duplicate／audit-truncated gate。v1.5.4 的檔名與 renderer 修復不改 normalized numeric schema；`CACHE_VERSION=7`、`NORMALIZED_SPOOL_VERSION=1` 與 `REVIEW_WORKBOOK_SCHEMA=AIS_V15_REVIEW_3` 不變。
+
 對政策選定的 21 或 32 方位，blank period decision 表示該 period final 留白，renderer 不保留該方位 detail rows，以維持 detail MAX 契約。只有 `klng21` 排除的 11 方位屬結構性空白；`all32` 的全部方向均為 decision scope。
 
 ## 7. 五份正式 Historical delivery
@@ -114,13 +126,13 @@ v1.5.2 為 `CACHE_VERSION=6`、`REVIEW_WORKBOOK_SCHEMA=AIS_V15_REVIEW_3`。方�
 
 Modern logical-day union-first selection 與 `MAX(period selections)` 並不具有數學等價性，因此兩者在 schema、GUI 與文件均使用不同名稱，不宣稱共用一個模糊 canonical value。
 
-寫檔時先完成五個 `.building.xlsx`，再備份舊五檔並整組 promote。任一步驟失敗會清除新檔並復原原 snapshot；若程式崩潰留下新舊並存的 rollback 狀態，下次執行會停止要求人工確認，避免混合月份成果。
+覆核 finalization 先完成五個 `.building.xlsx`，再備份舊五檔並整組 promote。v1.5.5 首次完整分析則把 Modern 與五份 Historical 全部先寫入同磁碟的隔離 staging，六份完成後才整組 promote；一般錯誤會復原原 snapshot。final／temporary／rollback 路徑碰撞在寫檔前拒絕，同一台電腦上的 GUI／CLI 程序共用輸出與 cache／spool 資源鎖。若程序崩潰留下 lock 或新舊並存的 rollback，保留現況並停止要求人工確認；此鎖不宣稱能協調不同電腦同時寫入同一 NAS 位置。
 
 每張工作表最多 1,048,576 列，扣除標題後明細上限為 1,048,575。超限在正式發布前報錯；v1.5.1 不截斷，也不自動 split。
 
 ### 雷達圖與選值上限
 
-全部雷達均引用 32 欄 B:AG；方位政策決定哪幾欄可以有值，缺值不補 0。`radar_style=auto` 對 KLNG 使用既有線形，其他站點使用填色；可明確指定 line／filled。
+全部雷達均引用 32 欄 B:AG；方位政策決定哪幾欄可以有值，缺值不補 0。`radar_style=auto` 依六月確認成果使用 filled radar；可明確指定 line／filled。Historical renderer 使用 reference 的 30 色 palette、60% transparency、圖表尺寸／位置與 MAX／MIN／AVG 配色，但保留修正後的實際資料 range，不複製 reference 的舊錯位 range。
 
 `radar_max` 只影響圖表刻度，預設留白使用自動尺度；指定時不得裁掉該圖要呈現的有效數值。它不篩選資料。`max_distance` 是 selector 上限（預設 500 NM），不是雷達軸上限。參考照片的 150、300 不構成所有月份必須固定該刻度的研究規則。
 

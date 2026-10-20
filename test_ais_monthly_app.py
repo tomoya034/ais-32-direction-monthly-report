@@ -14,6 +14,7 @@ import openpyxl
 from ais_monthly_app import (
     AppConfig,
     Candidate,
+    SourceFileError,
     _cache_directory,
     _legacy_spool_directory,
     build_processing_job,
@@ -264,6 +265,18 @@ class MultiPortTests(unittest.TestCase):
         parsed = parse_source_filename("d&tmok hwln_20260101_23.XLSX")
         self.assertIsNotNone(parsed)
         self.assertEqual((parsed.port, parsed.day), ("HWLN", date(2026, 1, 1)))
+
+    def test_hwln_unpadded_day_filename_is_not_silently_dropped(self) -> None:
+        parsed = parse_source_filename("D&TMOK HWLN_2026041_23.xlsx")
+        self.assertIsNotNone(parsed)
+        self.assertEqual((parsed.port, parsed.day), ("HWLN", date(2026, 4, 1)))
+
+    def test_source_like_malformed_date_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            (folder / "D&TMOK HWLN_2026131_23.xlsx").touch()
+            with self.assertRaises(SourceFileError):
+                detect_source_catalog(folder)
 
     def test_port_pattern_rejects_unsafe_or_overly_loose_names(self) -> None:
         invalid = (

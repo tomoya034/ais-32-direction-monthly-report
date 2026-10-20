@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import calendar
 import concurrent.futures
+import copy
+import contextlib
+import functools
 import hashlib
+import inspect
 import json
 import math
 import multiprocessing
 import os
+import posixpath
 import queue
 import re
 import shutil
@@ -15,10 +20,13 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import zipfile
+import uuid
+import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -28,10 +36,14 @@ from typing import Callable, Iterable, Sequence
 import openpyxl
 import xlsxwriter
 
+from ais_source_preflight import (
+    PreflightCancelled, preflight_sources, verify_source_identity, write_preflight_report,
+)
+
 
 APP_TITLE = "AIS 32方位月報一鍵製作"
-APP_VERSION = "1.5.2"
-CACHE_VERSION = 6
+APP_VERSION = "1.5.6"
+CACHE_VERSION = 7
 NORMALIZED_SPOOL_VERSION = 1
 EXCEL_MAX_DATA_ROWS = 1_048_575
 NORMALIZED_SPOOL_MAGIC = b"AISNRM1\0"
@@ -69,10 +81,22 @@ DIRECTION_POLICIES = ("auto", "klng21", "all32")
 RADAR_STYLES = ("auto", "line", "filled")
 
 FILENAME_RE = re.compile(
-    r"^D&TMOK[ \t]+(?P<port>[A-Z][A-Z0-9]{1,15})_(?P<date>\d{8})(?:_(?P<suffix>[A-Z0-9_-]+))?\.xlsx$",
+    r"^D&TMOK[ \t]+(?P<port>[A-Z][A-Z0-9]{1,15})_(?P<date>\d{7,8})(?:_(?P<suffix>[A-Z0-9_-]+))?\.xlsx$",
     re.IGNORECASE,
 )
+SOURCE_LIKE_FILENAME_RE = re.compile(r"^D&TMOK[ \t]+.*\.xlsx$", re.IGNORECASE)
 PORT_RE = re.compile(r"^[A-Z][A-Z0-9]{1,15}$")
+
+# Visual contract reproduced from the accepted June 2026 manual/senior workbook.
+# The 30-color Office palette is intentionally longer than a six-color theme cycle:
+# adjacent days must remain visually distinguishable in a full month.
+LEGACY_RADAR_PALETTE = (
+    "#5B9BD5", "#ED7D31", "#A5A5A5", "#FFC000", "#4472C4", "#70AD47",
+    "#255E91", "#9E480E", "#636363", "#997300", "#264478", "#43682B",
+    "#7CAFDD", "#F1975A", "#B7B7B7", "#FFCD33", "#698ED0", "#8CC168",
+    "#327DC2", "#D26012", "#848484", "#CC9A00", "#335AA1", "#5A8A39",
+    "#9DC3E6", "#F4B183", "#C9C9C9", "#FFD966", "#8FAADC", "#A9D18E",
+)
 
 ProgressCallback = Callable[[dict], None]
 
@@ -83,6 +107,12 @@ class CancelledError(RuntimeError):
 
 class SourceFileError(RuntimeError):
     pass
+
+
+class SourcePreflightError(SourceFileError):
+    def __init__(self, message: str, report_path: Path):
+        super().__init__(message)
+        self.report_path = report_path
 
 
 @dataclass(frozen=True)
@@ -265,7 +295,9 @@ class AppConfig:
         if self.radar_style not in RADAR_STYLES:
             raise ValueError("雷達圖樣式必須是 auto、line 或 filled。")
         if self.radar_style == "auto":
-            return "line" if self.port == "KLNG" else "filled"
+            # The accepted June reference uses a filled radar. Keep an explicit
+            # ``line`` override for operators who need the alternative view.
+            return "filled"
         return self.radar_style
 
     def validate(self) -> None:
@@ -307,6 +339,7 @@ class AppConfig:
             raise ValueError("原格式相容版輸出檔必須是 .xlsx。")
         if self.legacy_output_path is not None and self.legacy_output_path.resolve() == self.output_path.resolve():
             raise ValueError("新版與原格式版不可使用同一個輸出檔名。")
+        _validate_output_layout(self)
         if self.output_path.exists() and not self.overwrite:
             raise FileExistsError(f"輸出檔已存在：{self.output_path}")
         if self.legacy_output_path is not None and self.legacy_output_path.exists() and not self.overwrite:
@@ -319,6 +352,223 @@ class AppConfig:
                 raise FileExistsError(
                     "正式交付檔已存在：" + "、".join(path.name for path in existing_delivery)
                 )
+
+
+_job_locks = threading.local()
+
+
+def _canonical_path(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def _validate_output_layout(
+    config: AppConfig,
+    root: Path | None = None,
+    protected_inputs: Sequence[Path] = (),
+) -> None:
+    targets = [config.output_path, *derive_delivery_paths(config, root).all_files()]
+    if config.legacy_output_path is not None:
+        targets.append(config.legacy_output_path)
+    canonical = [_canonical_path(path) for path in targets]
+    if len(canonical) != len(set(canonical)):
+        raise ValueError("Modern／Historical／相容版輸出路徑碰撞；每個成果必須使用不同檔名。")
+    artifacts = [
+        artifact
+        for path in targets
+        for artifact in (
+            path,
+            path.with_name(path.stem + ".building.xlsx"),
+            path.with_name(f".{path.name}.rollback"),
+        )
+    ]
+    artifact_keys = [_canonical_path(path) for path in artifacts]
+    if len(artifact_keys) != len(set(artifact_keys)):
+        raise ValueError("成果 final／temporary／rollback 路徑碰撞；請使用不同的輸出路徑。")
+    sources = {
+        _canonical_path(path)
+        for path in config.input_dir.glob("*.xlsx")
+        if SOURCE_LIKE_FILENAME_RE.match(path.name)
+    }
+    reserved = [_cache_directory(config).resolve(), _normalized_spool_directory(config).resolve()]
+    for path in artifacts:
+        resolved = path.resolve()
+        if _canonical_path(path) in sources:
+            raise ValueError(f"輸出不可覆寫原始 AIS 來源：{path}")
+        if any(resolved == directory or directory in resolved.parents for directory in reserved):
+            raise ValueError(f"輸出不可放入 cache／normalized spool 保留路徑：{path}")
+    for path in protected_inputs:
+        key = _canonical_path(path)
+        # Finalize reads Modern in place but never rewrites it. Every other
+        # target/artifact must be distinct from the selected review input.
+        if key in artifact_keys and key != _canonical_path(config.output_path):
+            raise ValueError(f"覆核輸入不可與 Historical／temporary／rollback 輸出路徑碰撞：{path}")
+        resolved = path.resolve()
+        if any(resolved == directory or directory in resolved.parents for directory in reserved):
+            raise ValueError(f"覆核輸入不可使用 cache／normalized spool 保留路徑：{path}")
+
+
+@contextlib.contextmanager
+def _exclusive_job(
+    config: AppConfig,
+    root: Path | None = None,
+    protected_inputs: Sequence[Path] = (),
+):
+    """Serialize all shared outputs and normalized storage, including separate apps."""
+    _validate_output_layout(config, root, protected_inputs)
+    output_resources = [
+        config.output_path,
+        *derive_delivery_paths(config).all_files(),
+        *derive_delivery_paths(config, root).all_files(),
+    ]
+    if config.legacy_output_path is not None:
+        output_resources.append(config.legacy_output_path)
+    resources = [
+        artifact
+        for path in output_resources
+        for artifact in (
+            path,
+            path.with_name(path.stem + ".building.xlsx"),
+            path.with_name(f".{path.name}.rollback"),
+        )
+    ] + [_cache_directory(config), _normalized_spool_directory(config), *protected_inputs]
+    with _exclusive_resources(resources):
+        yield
+
+
+@contextlib.contextmanager
+def _exclusive_resources(resources: Sequence[Path]):
+    """Lock selected inputs before metadata parsing, then reenter for their job."""
+    held = getattr(_job_locks, "held", None)
+    if held is None:
+        held = _job_locks.held = set()
+    acquired = []
+    token = uuid.uuid4().hex
+    lock_root = Path(tempfile.gettempdir()) / "AIS32_job_locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    try:
+        for key, path in sorted({_canonical_path(p): p.resolve() for p in resources}.items()):
+            if key in held:
+                continue
+            # Keep locks out of read-only AIS inputs, even when an operator selects
+            # an output next to an input file. Canonical resource keys are shared
+            # by every local app/CLI instance regardless of the selected output root.
+            lock_path = lock_root / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".lock")
+            try:
+                descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError as error:
+                raise RuntimeError(
+                    f"此輸出或 cache 正由另一個工作使用，或上次工作留下 lock：{lock_path}；"
+                    "請確認其他程序已停止並保留現況後人工處理 lock。"
+                ) from error
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump({"pid": os.getpid(), "token": token, "resource": key}, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                lock_path.unlink(missing_ok=True)
+                raise
+            held.add(key)
+            acquired.append((key, lock_path))
+        yield
+    finally:
+        for key, lock_path in reversed(acquired):
+            try:
+                metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+                if metadata.get("token") == token:
+                    lock_path.unlink()
+            finally:
+                held.discard(key)
+
+
+def _guarded_job(function):
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def guarded(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs).arguments
+        with _exclusive_job(bound["config"], bound.get("root")):
+            return function(*args, **kwargs)
+
+    return guarded
+
+
+def _guarded_review_job(function):
+    @functools.wraps(function)
+    def guarded(reviewed_workbook, **kwargs):
+        reviewed_workbook = Path(reviewed_workbook)
+        with _exclusive_resources((reviewed_workbook,)):
+            config = config_from_review_workbook(
+                reviewed_workbook,
+                delivery_dir=kwargs.get("delivery_dir"),
+                overwrite=kwargs.get("overwrite", False),
+            )
+            with _exclusive_job(config, kwargs.get("delivery_dir"), (reviewed_workbook,)):
+                return function(reviewed_workbook, **kwargs)
+
+    return guarded
+
+
+def _recover_output_backups(final_files: Sequence[Path]) -> None:
+    for final_path in final_files:
+        rollback_path = final_path.with_name(f".{final_path.name}.rollback")
+        if rollback_path.exists():
+            if final_path.exists():
+                raise FileExistsError(
+                    f"偵測到未完成的成果替換且新舊檔並存：{rollback_path}；請保留現況並人工確認。"
+                )
+            os.replace(rollback_path, final_path)
+
+
+def _promote_output_set(staged: dict[Path, Path], *, overwrite: bool) -> None:
+    """Promote one whole output set; restore all previous files on any failure."""
+    _recover_output_backups(tuple(staged))
+    if not overwrite:
+        existing = [path for path in staged if path.exists()]
+        if existing:
+            raise FileExistsError("正式成果已存在：" + "、".join(str(path) for path in existing))
+    backed_up = {}
+    promoted = []
+    try:
+        for final_path in staged:
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                if not overwrite:
+                    raise FileExistsError(f"正式成果已存在：{final_path}")
+                rollback_path = final_path.with_name(f".{final_path.name}.rollback")
+                os.replace(final_path, rollback_path)
+                backed_up[final_path] = rollback_path
+        for final_path, temporary in staged.items():
+            if overwrite:
+                os.replace(temporary, final_path)
+            elif os.name == "nt":
+                # Windows rename fails if the destination appeared after our check.
+                os.rename(temporary, final_path)
+            else:
+                # POSIX rename replaces existing files; an exclusive hard-link
+                # promotion preserves a destination created by another program.
+                os.link(temporary, final_path)
+            promoted.append(final_path)
+            if not overwrite and os.name != "nt":
+                temporary.unlink()
+    except BaseException as error:
+        rollback_errors = []
+        for final_path in promoted:
+            try:
+                final_path.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                rollback_errors.append(f"移除 {final_path}: {rollback_error}")
+        for final_path, rollback_path in backed_up.items():
+            try:
+                if rollback_path.exists():
+                    os.replace(rollback_path, final_path)
+            except OSError as rollback_error:
+                rollback_errors.append(f"還原 {final_path}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError("成果替換失敗且自動回復不完整：" + "；".join(rollback_errors)) from error
+        raise
+    for rollback_path in backed_up.values():
+        rollback_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -390,6 +640,19 @@ def resolve_direction_policy(port: str, policy: str = "auto") -> str:
     return policy
 
 
+def legacy_chart_direction_indexes(config: AppConfig) -> tuple[int, ...]:
+    """Reference chart order, independent of the visible B:AG table order.
+
+    The accepted KLNG workbooks begin the statistics chart at WSW and wrap
+    through ESE.  The old workbook achieved that presentation with a fragile
+    contiguous source range.  The helper range preserves the same visual order
+    while explicitly mapping the correct 21 values.
+    """
+    if config.resolved_direction_policy == "klng21":
+        return tuple(range(22, 32)) + tuple(range(0, 11))
+    return config.direction_indexes
+
+
 def _review_direction_policy(metadata: dict[str, object]) -> str:
     policy = str(metadata.get("Direction policy", ""))
     if policy not in ("klng21", "all32"):
@@ -407,11 +670,18 @@ def _radar_options(config: AppConfig, *, modern: bool = False) -> dict[str, str]
 
 
 def _radar_series_style(config: AppConfig, color: str, *, modern: bool = False) -> dict[str, object]:
-    style: dict[str, object] = {
-        "line": {"color": color, "width": 0.75, "transparency": 45 if modern else 35},
-    }
     if config.resolved_radar_style == "filled":
-        style["fill"] = {"color": color, "transparency": 35}
+        # Excel serializes 60% transparency as a:alpha=40000, matching the
+        # accepted reference. A border is deliberately omitted for filled radar.
+        style: dict[str, object] = {"fill": {"color": color, "transparency": 60}}
+    else:
+        style = {
+            "line": {
+                "color": color,
+                "width": 0.75,
+                "transparency": 45 if modern else 35,
+            },
+        }
     if modern:
         style["marker"] = {"type": "none"}
     return style
@@ -456,8 +726,16 @@ def parse_source_filename(filename: str) -> SourceFileIdentity | None:
     match = FILENAME_RE.match(filename)
     if not match:
         return None
+    date_token = match.group("date")
     try:
-        parsed_day = datetime.strptime(match.group("date"), "%Y%m%d").date()
+        if len(date_token) == 7:
+            # HWLN 2026-04-01..09 are named YYYYMMd (one-digit day).
+            # Month remains two digits, so this is unambiguous.
+            parsed_day = date(
+                int(date_token[:4]), int(date_token[4:6]), int(date_token[6:])
+            )
+        else:
+            parsed_day = datetime.strptime(date_token, "%Y%m%d").date()
     except ValueError:
         return None
     suffix = match.group("suffix")
@@ -479,6 +757,11 @@ def scan_source_files(folder: Path) -> tuple[dict[str, dict[date, DayInput]], di
     for path in sorted(folder.glob("*.xlsx"), key=lambda item: item.name.casefold()):
         identity = parse_source_filename(path.name)
         if identity is None:
+            if SOURCE_LIKE_FILENAME_RE.match(path.name):
+                raise SourceFileError(
+                    f"來源檔名看似 AIS 原始檔但無法解析：{path.name}。"
+                    "為避免靜默漏資料，本次掃描已停止。"
+                )
             continue
         grouped.setdefault(identity.port, {}).setdefault(identity.day, []).append(
             SourceFragment(
@@ -559,7 +842,7 @@ def resolve_source_period(
         raise ValueError("年份與月份必須同時指定；也可以兩者都省略，改由檔名自動判定。")
     catalog = detect_source_catalog(folder)
     if not catalog:
-        raise ValueError("找不到符合 D&TMOK <PORT>_YYYYMMDD_*.xlsx 格式的檔案。")
+        raise ValueError("找不到符合 D&TMOK <PORT>_YYYYMMDD_*.xlsx（個位日期亦接受 YYYYMMd）格式的檔案。")
     if port is None:
         if len(catalog) != 1:
             listing = "、".join(catalog)
@@ -1287,7 +1570,8 @@ def read_legacy_spool(path: Path) -> tuple[list[int], Iterable[tuple[int, float,
 
 def _process_day_worker(arguments: tuple[DayInput, AppConfig]) -> tuple[date, DayResult]:
     day_input, config = arguments
-    return day_input.day, process_day_input(day_input, config)
+    # The owning month job holds shared-storage locks while workers write distinct days.
+    return day_input.day, process_day_input.__wrapped__(day_input, config)
 
 
 def preflight_output_space(config: AppConfig, source_files: Iterable[Path]) -> tuple[int, int | None]:
@@ -1324,6 +1608,7 @@ def preflight_output_space(config: AppConfig, source_files: Iterable[Path]) -> t
     return sum(requirements.values()), min(available) if available else None
 
 
+@_guarded_job
 def process_day_input(
     day_input: DayInput,
     config: AppConfig,
@@ -1531,12 +1816,15 @@ def process_day_input(
                     if audit_truncated:
                         break
                 if audit_truncated:
-                    diagnostics.append(
+                    raise SourceFileError(
+                        "來源 fragments 重疊安全檢查未通過："
+                        f"{first.path.name} / {second.path.name}；"
                         "normal same-second / possible duplicate event / exact normalized core "
-                        f"record audit 超過 {DUPLICATE_AUDIT_RECORD_LIMIT:,} 筆上限，未完整計數；"
-                        "非 byte-identical fragments 未自動去重"
+                        f"record audit 超過 {DUPLICATE_AUDIT_RECORD_LIMIT:,} 筆上限，"
+                        "無法證明兩檔沒有重複紀錄。為避免重複計入，本次月份處理已停止，"
+                        "不會繼續產生或替換正式檔。請移除其中一個重複檔，或另建只含已確認"
+                        "互補 fragments 的安全來源資料夾後重跑。"
                     )
-                    continue
                 exact_key = lambda record: (
                     record.second_of_day,
                     record.msg_type,
@@ -1553,6 +1841,15 @@ def process_day_input(
                 left_exact = Counter(exact_key(record) for record in left_records)
                 right_exact = Counter(exact_key(record) for record in right_records)
                 exact_duplicates = sum((left_exact & right_exact).values())
+                if exact_duplicates:
+                    raise SourceFileError(
+                        "來源 fragments 重疊安全檢查未通過："
+                        f"{first.path.name} / {second.path.name}；"
+                        f"偵測到 exact normalized core records：{exact_duplicates:,} 筆。"
+                        "程式不會 silent dedupe；為避免重複計入，本次月份處理已停止，"
+                        "不會繼續產生或替換正式檔。請移除其中一個重複檔，或另建只含已確認"
+                        "互補 fragments 的安全來源資料夾後重跑。"
+                    )
                 left_events = Counter(
                     event_key(record) for record in left_records if record.mmsi is not None
                 )
@@ -1660,12 +1957,100 @@ def build_processing_job(config: AppConfig) -> ProcessingJob:
     )
 
 
+def inspect_source_preflight(
+    folder: Path, *, port: str | None = None, year: int | None = None,
+    month: int | None = None, recursive: bool = False, workers: int = 1,
+    callback: ProgressCallback | None = None, cancel_event: threading.Event | None = None,
+) -> dict:
+    """Discover sources without changing filename, datetime or selection rules."""
+    if not folder.is_dir():
+        raise SourceFileError(f"來源資料夾不存在：{folder}")
+    if (year is None)!=(month is None):
+        raise ValueError("年份與月份必須同時指定。")
+    if year is not None:
+        date(year, month, 1)
+    if not 1<=workers<=8:
+        raise ValueError("平行日期數必須介於 1 到 8。")
+    port = normalize_port(port) if port else None
+    paths = sorted(folder.rglob("*.xlsx") if recursive else folder.glob("*.xlsx"),key=lambda p:str(p).casefold())
+    sources, issues, ignored = [], [], []
+    for path in paths:
+        if path.name.startswith("~$"):
+            ignored.append({"path":str(path.resolve()),"reason":"EXCEL_TEMPORARY_FILE_NOT_INPUT"})
+            continue
+        identity = parse_source_filename(path.name)
+        if identity is None:
+            if SOURCE_LIKE_FILENAME_RE.match(path.name):
+                issues.append({"path":str(path.resolve()),"classification":"UNPARSEABLE_AIS_FILENAME"})
+            else:
+                ignored.append({"path":str(path.resolve()),"reason":"NOT_AIS_SOURCE_FILENAME"})
+            continue
+        if (port and identity.port!=port) or (year is not None and (identity.day.year,identity.day.month)!=(year,month)):
+            ignored.append({"path":str(path.resolve()),"reason":"OUTSIDE_SELECTED_PORT_MONTH"})
+            continue
+        sources.append({"path":str(path.resolve()),"port":identity.port,"filename_date":identity.day.isoformat(),"suffix":identity.suffix})
+    try:
+        report = preflight_sources(sources,REQUIRED_HEADERS,workers=workers,
+                                  overlap_limit=DUPLICATE_AUDIT_RECORD_LIMIT,discovery_issues=issues,
+                                  ignored_files=ignored,physical_xlsx_count=len(paths),callback=callback,cancel_event=cancel_event)
+    except PreflightCancelled as error:
+        raise CancelledError("來源預檢已取消；未進入正式月份處理。") from error
+    report["input_directory"] = str(folder.resolve())
+    report["selected_scope"] = {"port":port,"year":year,"month":month,"recursive":recursive}
+    report["application_version"] = APP_VERSION
+    return report
+
+
+def save_source_preflight(report: dict, directory: Path) -> Path:
+    source = Path(report["input_directory"]).resolve()
+    target = directory.resolve()
+    if target==source or source in target.parents:
+        raise ValueError("來源預檢報告不可寫入原始來源資料夾。")
+    return write_preflight_report(report,target)
+
+
+def require_safe_source_preflight(
+    config: AppConfig, callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict, Path]:
+    emit(callback,kind="source_preflight_start",file=str(config.input_dir))
+    report = inspect_source_preflight(config.input_dir,port=config.port,year=config.year,month=config.month,
+                                     workers=config.workers,callback=callback,cancel_event=cancel_event)
+    parent = config.output_path.parent.resolve()
+    source_root = config.input_dir.resolve()
+    if parent==source_root or source_root in parent.parents:
+        # Preserve the established output layout API without putting new
+        # diagnostic sidecars in the source folder (including existing tests).
+        parent = Path(tempfile.gettempdir())/"AIS32_source_preflight"
+    directory = parent / f"SOURCE_PREFLIGHT_{config.port}_{config.year}{config.month:02d}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+    path = save_source_preflight(report,directory)
+    emit(callback,kind="source_preflight_done",status=report["status"],report=str(path),source_days=report["source_days"],calendar_days=report["calendar_days"])
+    if report["status"]=="BLOCKED":
+        codes = sorted({issue for f in report["files"] for issue in f["issues"]} |
+                       {label for p in report["fragment_pairs"] if p["blocked"] for label in p["classifications"]} |
+                       {i["classification"] for i in report["discovery_issues"]})
+        details = []
+        for pair in report["fragment_pairs"]:
+            if not pair['blocked']:
+                continue
+            details.append(f"{Path(pair['left']).name} / {Path(pair['right']).name}；exact normalized core records：{pair['exact_normalized_core_rows_shared']:,} 筆")
+            if 'PRODUCTION_OVERLAP_AUDIT_LIMIT' in pair['classifications']:
+                details.append(f"record audit 超過 {DUPLICATE_AUDIT_RECORD_LIMIT:,} 筆上限，無法證明兩檔沒有重複紀錄")
+        raise SourcePreflightError("來源預檢未通過："+", ".join(codes or ["NO_APPLICABLE_SOURCE"])+
+                                   "。本次月份處理已停止，未建立或替換正式成果。"+"；".join(details[:12])+
+                                   "。若需移除其中一個重複檔，請依已確認 manifest 在隔離安全來源資料夾排除，不要刪改原始檔。"+
+                                   f"詳細報告：{path}",path)
+    return report,path
+
+
+@_guarded_job
 def process_month(
     config: AppConfig,
     callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[list[DayResult], list[str]]:
     config.validate()
+    source_preflight, source_preflight_path = require_safe_source_preflight(config,callback,cancel_event)
     job = build_processing_job(config)
     month_days = {day_input.day: day_input for day_input in job.days}
     warnings = list(job.warnings)
@@ -1778,6 +2163,15 @@ def process_month(
                     future.cancel()
                 raise
 
+    try:
+        verify_source_identity(source_preflight)
+        expected_sha = {Path(f["path"]).resolve():f["sha256"].casefold() for f in source_preflight["files"]}
+        for result in processed.values():
+            for fragment in result.fragment_info:
+                if expected_sha.get(fragment.path.resolve())!=fragment.sha256.casefold():
+                    raise ValueError(f"處理時來源身分與預檢不同：{fragment.path}")
+    except (OSError,ValueError) as error:
+        raise SourcePreflightError(f"來源在預檢後變更；本月份未建立或替換正式成果：{error}",source_preflight_path) from error
     days_in_month = calendar.monthrange(config.year, config.month)[1]
     output: list[DayResult] = []
     for day_number in range(1, days_in_month + 1):
@@ -2010,7 +2404,7 @@ def validate_review_workbook_schema(schema: object) -> None:
         )
     if schema == "AIS_V15_REVIEW_2":
         raise ValueError(
-            "v1.5.1 覆核 workbook 缺少港別方位政策；v1.5.2 不會把舊 21 方位台帳自動升為 32 方位。"
+            "v1.5.1 覆核 workbook 缺少港別方位政策；目前版本不會把舊 21 方位台帳自動升為 32 方位。"
             "請由原始月份資料重新分析並覆核。"
         )
     if schema != REVIEW_WORKBOOK_SCHEMA:
@@ -2144,6 +2538,25 @@ def _excel_col(column_zero_based: int) -> str:
     return letters
 
 
+def _excel_numeric_reference_or_blank(reference: str) -> str:
+    """Keep empty/text source cells blank after native Excel recalculation."""
+    return f'=IF(COUNT({reference})=0,"",{reference})'
+
+
+def _excel_stat_or_blank(function: str, reference: str) -> str:
+    """Avoid MAX/MIN empty-range zeroes and STDEV.S one-value errors."""
+    minimum_count = 2 if function.endswith("STDEV.S") else 1
+    return (
+        f'=IF(COUNT({reference})<{minimum_count},"",'
+        f'{function}({reference}))'
+    )
+
+
+def _excel_chart_reference_or_na(reference: str) -> str:
+    """Use missing markers only for chart helpers, never primary data cells."""
+    return f'=IF(COUNT({reference})=0,NA(),{reference})'
+
+
 def _safe_sheet_name(name: str) -> str:
     return re.sub(r"[\[\]:*?/\\]", "_", name)[:31]
 
@@ -2162,6 +2575,7 @@ def _stats(values: Iterable[float | None]) -> tuple[float | None, float | None, 
     return max(valid), min(valid), statistics.mean(valid), stdev
 
 
+@_guarded_job
 def write_monthly_workbook(
     config: AppConfig,
     day_results: list[DayResult],
@@ -2169,6 +2583,8 @@ def write_monthly_workbook(
     decision_snapshot: DecisionSnapshot | None = None,
     callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    _staging_path: Path | None = None,
 ) -> Path:
     if decision_snapshot is None:
         decision_snapshot = build_default_decision_snapshot(config, day_results)
@@ -2187,8 +2603,9 @@ def write_monthly_workbook(
         for day_result in day_results
         for diagnostic in day_result.diagnostics
     ]
-    config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = config.output_path.with_name(config.output_path.stem + ".building.xlsx")
+    target_path = _staging_path or config.output_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(target_path.stem + ".building.xlsx")
     if temp_path.exists():
         temp_path.unlink()
 
@@ -2609,7 +3026,8 @@ def write_monthly_workbook(
                 continue
             direction_result = day_result.directions[direction]
             source_column = _excel_col(7 + direction_index)
-            formula = f'=IFERROR(\'{source_sheet}\'!{source_column}4,"")'
+            source_reference = f"'{source_sheet}'!{source_column}4"
+            formula = _excel_numeric_reference_or_blank(source_reference)
             final_value = decision_values[(LOGICAL_DAY, day_result.day, direction)]
             cached = final_value if final_value is not None else ""
             status_format = formats["auto"] if direction_result.status == "自動採用" else formats["review"] if direction_result.status == "待複核" else formats["missing"]
@@ -2631,7 +3049,8 @@ def write_monthly_workbook(
                 total_sheet.write_blank(row, column, None, formats["excluded"])
                 continue
             col_letter = _excel_col(column)
-            formula = f'=IFERROR({function}({col_letter}{first_data_row_excel}:{col_letter}{last_data_row_excel}),"")'
+            stat_reference = f"{col_letter}{first_data_row_excel}:{col_letter}{last_data_row_excel}"
+            formula = _excel_stat_or_blank(function, stat_reference)
             cached = stat_values_by_direction[direction][stat_offset]
             total_sheet.write_formula(row, column, formula, formats["stat"], cached if cached is not None else "")
 
@@ -2647,29 +3066,61 @@ def write_monthly_workbook(
         total_sheet.write(row, 34, direction, formats["body"])
         for stat_offset, helper_col in enumerate((35, 36, 37)):
             source_row_excel = stat_start_row + stat_offset + 1
-            formula = f'=IFERROR({source_col}{source_row_excel},"")'
+            reference = f"{source_col}{source_row_excel}"
+            # Excel plots formula "" as zero even with gap mode. Only these
+            # chart-only helpers use deliberate #N/A; primary tables stay blank.
+            formula = _excel_chart_reference_or_na(reference)
             cached = stat_values_by_direction[direction][stat_offset]
-            total_sheet.write_formula(row, helper_col, formula, formats["number"], cached if cached is not None else "")
+            total_sheet.write_formula(row, helper_col, formula, formats["number"], cached if cached is not None else "#N/A")
+
+    # Native Excel also converts formula "" in the daily radar source to 0.
+    # Keep primary cells untouched and bind the chart to explicit missing-marker
+    # helpers, including genuinely excluded port-policy directions.
+    radar_helper_first_col = 40  # AO:BT, outside the reader-facing print area.
+    total_sheet.set_column(radar_helper_first_col, radar_helper_first_col + 31,
+                           10, None, {"hidden": True})
+    for direction_index, direction in enumerate(DIRECTION_ORDER):
+        helper_col = radar_helper_first_col + direction_index
+        total_sheet.write(3, helper_col, direction, formats["header"])
+        for day_offset, day_result in enumerate(day_results):
+            excel_row = first_data_row_excel + day_offset
+            reference = f"{_excel_col(1 + direction_index)}{excel_row}"
+            value = decision_values.get((LOGICAL_DAY, day_result.day, direction))
+            total_sheet.write_formula(excel_row - 1, helper_col,
+                                      _excel_chart_reference_or_na(reference),
+                                      formats["number"], value if value is not None else "#N/A")
 
     radar = workbook.add_chart(_radar_options(config, modern=True))
+    # Excel otherwise omits series bound to hidden helper columns entirely.
+    radar.show_hidden_data()
     palette = ["#2F6B7C", "#D97706", "#7C3AED", "#15803D", "#B91C1C", "#0369A1", "#A21CAF"]
-    for day_offset, day_result in enumerate(day_results):
-        if not any(
+    radar_days = [
+        (offset, day_result) for offset, day_result in enumerate(day_results)
+        if any(
             decision_values.get((LOGICAL_DAY, day_result.day, DIRECTION_ORDER[index])) is not None
             for index in config.direction_indexes
-        ):
-            continue
+        )
+    ]
+    empty_month = not radar_days
+    if empty_month and day_results:
+        # XlsxWriter requires at least one series. Keep the real first daily
+        # range and an entirely missing cache, just as Historical empty periods.
+        radar_days = [(0, day_results[0])]
+    for day_offset, day_result in radar_days:
         excel_row = first_data_row_excel + day_offset
         radar.add_series(
             {
-                "name": f"{config.month}/{day_result.day.day}",
+                "name": "本時段無有效資料" if empty_month else f"{config.month}/{day_result.day.day}",
                 "categories": ["總表", 3, 1, 3, 32],
-                "values": ["總表", excel_row - 1, 1, excel_row - 1, 32],
+                "values": ["總表", excel_row - 1, radar_helper_first_col,
+                           excel_row - 1, radar_helper_first_col + 31],
                 "values_data": [decision_values.get((LOGICAL_DAY, day_result.day, direction)) for direction in DIRECTION_ORDER],
                 **_radar_series_style(config, palette[day_offset % len(palette)], modern=True),
             }
         )
-    radar.set_title({"name": f"{config.year}-{config.month:02d} AIS 通訊涵蓋圖"})
+    radar.set_title(
+        {"name": f"{config.year}-{config.month:02d} AIS 通訊涵蓋圖（Modern logical-day）"}
+    )
     radar.set_legend({"position": "bottom", "font": {"size": 8}})
     radar.set_size({"width": 1080, "height": 560})
     radar.set_style(10)
@@ -2680,12 +3131,16 @@ def write_monthly_workbook(
 
     columns = workbook.add_chart({"type": "column"})
     category_range = ["總表", helper_row + 1, 34, helper_row + len(config.direction_indexes), 34]
-    for series_name, helper_col, color in (("最遠", 35, "#2F6B7C"), ("最近", 36, "#D97706")):
+    for stat_offset, (series_name, helper_col, color) in enumerate((("最遠", 35, "#2F6B7C"), ("最近", 36, "#D97706"))):
         columns.add_series(
             {
                 "name": series_name,
                 "categories": category_range,
                 "values": ["總表", helper_row + 1, helper_col, helper_row + len(config.direction_indexes), helper_col],
+                # Explicit None preserves missing points, including a trailing
+                # blank formula cache which XlsxWriter's range scan fills as 0.
+                "values_data": [stat_values_by_direction[DIRECTION_ORDER[index]][stat_offset]
+                                for index in config.direction_indexes],
                 "fill": {"color": color, "transparency": 10},
                 "border": {"none": True},
             }
@@ -2696,12 +3151,21 @@ def write_monthly_workbook(
             "name": "平均",
             "categories": category_range,
             "values": ["總表", helper_row + 1, 37, helper_row + len(config.direction_indexes), 37],
+            "values_data": [stat_values_by_direction[DIRECTION_ORDER[index]][2]
+                            for index in config.direction_indexes],
             "line": {"color": "#B91C1C", "width": 2.25},
             "marker": {"type": "circle", "size": 4, "border": {"color": "#B91C1C"}, "fill": {"color": "#FFFFFF"}},
         }
     )
     columns.combine(line)
-    columns.set_title({"name": f"{config.year}-{config.month:02d} AIS 通訊最近、最遠與平均距離（NM）"})
+    columns.set_title(
+        {
+            "name": (
+                f"{config.year}-{config.month:02d} AIS 通訊最近、最遠與平均距離"
+                "（NM；Modern logical-day）"
+            )
+        }
+    )
     columns.set_y_axis({"name": "海里（NM）", "major_gridlines": {"visible": True, "line": {"color": "#D9E2E8"}}, "num_format": "0"})
     columns.set_x_axis({"label_position": "low", "num_font": {"rotation": -45, "size": 8}})
     columns.set_legend({"position": "bottom"})
@@ -2799,7 +3263,7 @@ def write_monthly_workbook(
 
     try:
         workbook.close()
-        os.replace(temp_path, config.output_path)
+        os.replace(temp_path, target_path)
     except Exception:
         try:
             workbook.close()
@@ -2807,9 +3271,10 @@ def write_monthly_workbook(
             pass
         raise
     emit(callback, kind="write_done", file=config.output_path.name)
-    return config.output_path
+    return target_path
 
 
+@_guarded_job
 def write_legacy_workbook(
     config: AppConfig,
     day_results: list[DayResult],
@@ -2913,7 +3378,8 @@ def write_legacy_workbook(
                     continue
                 source_column = _excel_col(7 + direction_index)
                 selected = day_result.directions[direction].selected
-                formula = f"=IFERROR('{source_sheet}'!{source_column}2,\"\")"
+                source_reference = f"'{source_sheet}'!{source_column}2"
+                formula = _excel_numeric_reference_or_blank(source_reference)
                 summary.write_formula(row, 1 + direction_index, formula, number_format, selected if selected is not None else "")
 
         stat_start = len(day_results) + 2
@@ -3067,6 +3533,305 @@ def _integrated_period_values(
     return integrated
 
 
+@dataclass(frozen=True)
+class _HistoricalLayout:
+    """Geometry from the accepted manual June artifacts, not a port policy.
+
+    A full/summary: ``32方位數值_2[ 總表].xlsx``; B full/summary:
+    ``32方位數值[ 總表].xlsx``; integrated: ``每日較大值整合總表.xlsx``.
+    Anchors are native OOXML (column, row, column EMU, row EMU). B full
+    deliberately has wider columns than B summary despite identical anchors.
+    XlsxWriter's Calibri-11 pixel conversion cannot express these exactly.
+    """
+
+    columns: tuple[tuple[int, int, str], ...]
+    default_column_width: str | None
+    radar_from: tuple[int, int, int, int]
+    radar_to: tuple[int, int, int, int]
+    statistics_from: tuple[int, int, int, int]
+    statistics_to: tuple[int, int, int, int]
+    radar_plot: tuple[float, float, float, float] | None
+    radar_legend: tuple[float, float, float, float]
+
+
+_HISTORICAL_A_LAYOUT = _HistoricalLayout(
+    (), None,
+    (12, 1, 9524, 19050), (22, 30, 609599, 190500),
+    (0, 43, 9525, 0), (14, 56, 590550, 142875),
+    (0.064771103328797777, 0.17572538384888339,
+     0.65954183489103524, 0.74501858184039171),
+    (0.76830972615675164, 0.10649836959552665,
+     0.22035882908404159, 0.83653926912995602),
+)
+_HISTORICAL_B_LAYOUT = _HistoricalLayout(
+    ((1, 1, "14.5703125"),), "9",
+    (11, 1, 838200, 33336), (23, 31, 0, 9525),
+    (0, 43, 0, 14287), (15, 56, 9524, 157162), None,
+    (0.8682679434523134, 0.11656551957448454,
+     0.12020467902607275, 0.82470676043372704),
+)
+HISTORICAL_LAYOUTS = {
+    "full_a": _HISTORICAL_A_LAYOUT,
+    "summary_a": _HISTORICAL_A_LAYOUT,
+    "full_b": _HistoricalLayout(
+        ((1, 1, "14.5703125"), (2, 6, "12.7109375"),
+         (7, 7, "11.5703125"), (8, 12, "12.7109375"),
+         (24, 33, "12.7109375")),
+        "9", _HISTORICAL_B_LAYOUT.radar_from, _HISTORICAL_B_LAYOUT.radar_to,
+        _HISTORICAL_B_LAYOUT.statistics_from, _HISTORICAL_B_LAYOUT.statistics_to,
+        None, _HISTORICAL_B_LAYOUT.radar_legend,
+    ),
+    "summary_b": _HISTORICAL_B_LAYOUT,
+    "integrated": _HistoricalLayout(
+        ((1, 1, "14.5703125"),), "9",
+        (12, 1, 0, 9524), (23, 31, 9525, 19049),
+        (0, 43, 0, 9525), (14, 56, 590549, 152400), None,
+        (0.87979532097392721, 0.12502090170582877,
+         0.10867730150445892, 0.82013252305426954),
+    ),
+}
+
+
+def _historical_layout(artifact_role: str) -> _HistoricalLayout:
+    try:
+        return HISTORICAL_LAYOUTS[artifact_role]
+    except KeyError as exc:
+        raise ValueError(f"未識別的 Historical artifact role：{artifact_role!r}") from exc
+
+
+def _apply_historical_geometry(path: Path, artifact_role: str, day_count: int) -> None:
+    """Normalize only authored sheet geometry, fonts and drawing anchors.
+
+    Retained detail sheets and chart formulas/series/caches are streamed through
+    unchanged. The temporary ZIP is exclusive, on the same volume, and promoted
+    only after all parts close successfully; no partial package replaces a file.
+    """
+    layout = _historical_layout(artifact_role)
+    if not 1 <= day_count <= 31:
+        raise ValueError("Historical geometry requires 1–31 actual day rows")
+    ns = {
+        "s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "x": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
+    with zipfile.ZipFile(path) as source:
+        workbook = ET.fromstring(source.read("xl/workbook.xml"))
+        relations = ET.fromstring(source.read("xl/_rels/workbook.xml.rels"))
+        targets = {item.get("Id"): item.get("Target") for item in relations}
+        summaries = [item for item in workbook.findall("s:sheets/s:sheet", ns)
+                     if item.get("name") == "總表"]
+        if len(summaries) != 1:
+            raise ValueError("Historical geometry requires exactly one 總表")
+        target = targets[summaries[0].get(f"{{{ns['r']}}}id")]
+        sheet_path = posixpath.normpath(posixpath.join("xl", target))
+        if target.startswith("/"):
+            sheet_path = target.lstrip("/")
+        sheet = ET.fromstring(source.read(sheet_path))
+        sheet_format = sheet.find("s:sheetFormatPr", ns)
+        if sheet_format is None:
+            raise ValueError("Historical 總表 lacks sheetFormatPr")
+        sheet_format.set("defaultRowHeight", "15.75")
+        sheet_format.attrib.pop("defaultColWidth", None)
+        if layout.default_column_width is not None:
+            sheet_format.set("defaultColWidth", layout.default_column_width)
+        old_columns = sheet.find("s:cols", ns)
+        has_radar_missing_helpers = old_columns is not None and any(
+            column.get("min") == "41" and column.get("max") == "72" and column.get("hidden") == "1"
+            for column in old_columns.findall("s:col", ns)
+        )
+        if old_columns is not None:
+            sheet.remove(old_columns)
+        columns = ET.Element(f"{{{ns['s']}}}cols")
+        for first, last, width in layout.columns:
+            ET.SubElement(columns, f"{{{ns['s']}}}col", {
+                "min": str(first), "max": str(last), "width": width, "customWidth": "1",
+            })
+        # These corrected helper cells are not in the manual artifacts. Keep
+        # them hidden without changing any visible reference column geometry.
+        ET.SubElement(columns, f"{{{ns['s']}}}col", {
+            "min": "35", "max": "38", "width": "0", "hidden": "1", "customWidth": "1",
+        })
+        if has_radar_missing_helpers:
+            ET.SubElement(columns, f"{{{ns['s']}}}col", {
+                "min": "41", "max": "72", "width": "0", "hidden": "1", "customWidth": "1",
+            })
+        sheet.insert(list(sheet).index(sheet_format) + 1, columns)
+        drawing = sheet.find("s:drawing", ns)
+        if drawing is None:
+            raise ValueError("Historical 總表 lacks a drawing")
+        sheet_rels_path = posixpath.join(posixpath.dirname(sheet_path), "_rels",
+                                        posixpath.basename(sheet_path) + ".rels")
+        sheet_relations = ET.fromstring(source.read(sheet_rels_path))
+        drawing_target = next(item.get("Target") for item in sheet_relations
+                              if item.get("Id") == drawing.get(f"{{{ns['r']}}}id"))
+        drawing_path = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path),
+                                                        drawing_target))
+        drawing_xml = ET.fromstring(source.read(drawing_path))
+        anchors = drawing_xml.findall("x:twoCellAnchor", ns)
+        if len(anchors) != 2 or len(list(drawing_xml)) != 2:
+            raise ValueError("Historical drawing requires exactly two native chart anchors")
+        shift = day_count - 30
+        for index, (anchor, start, end) in enumerate(zip(
+            anchors, (layout.radar_from, layout.statistics_from),
+            (layout.radar_to, layout.statistics_to),
+        )):
+            anchor.attrib.pop("editAs", None)  # Reference: move and size with cells.
+            for edge, point in (("from", start), ("to", end)):
+                vertex = anchor.find(f"x:{edge}", ns)
+                if vertex is None:
+                    raise ValueError("Historical drawing lacks a complete cell anchor")
+                col, row, col_emu, row_emu = point
+                for label, value in (("col", col), ("row", row + (shift if index else 0)),
+                                     ("colOff", col_emu), ("rowOff", row_emu)):
+                    element = vertex.find(f"x:{label}", ns)
+                    if element is None:
+                        raise ValueError("Historical drawing lacks a complete cell anchor")
+                    element.text = str(value)
+        styles = ET.fromstring(source.read("xl/styles.xml"))
+        for font in styles.findall("s:fonts/s:font/s:name", ns):
+            if font.get("val") == "Calibri":
+                font.set("val", "新細明體")
+        changed = {sheet_path: ET.tostring(sheet, encoding="utf-8", xml_declaration=True),
+                   drawing_path: ET.tostring(drawing_xml, encoding="utf-8", xml_declaration=True),
+                   "xl/styles.xml": ET.tostring(styles, encoding="utf-8", xml_declaration=True)}
+        if artifact_role == "integrated":
+            # Retain the Integrated reference's primary minor font definitions.
+            # Theme XML equality alone is not native rendering equivalence;
+            # the text-owner compatibility fix below is independently required.
+            theme = ET.fromstring(source.read("xl/theme/theme1.xml"))
+            minor = theme.find("a:themeElements/a:fontScheme/a:minorFont", ns)
+            if minor is None:
+                raise ValueError("Historical integrated theme lacks minorFont")
+            for script in ("latin", "ea", "cs"):
+                font = minor.find(f"a:{script}", ns)
+                if font is None:
+                    raise ValueError(f"Historical integrated theme lacks {script} font")
+                font.set("typeface", "Calibri")
+            # Integrated reference minorFont contains only these three faces.
+            # Removing fallbacks alone was experimentally insufficient to fix
+            # Excel's Integrated text-owner font resolution.
+            for font in list(minor):
+                if font.tag not in {f"{{{ns['a']}}}{script}" for script in ("latin", "ea", "cs")}:
+                    minor.remove(font)
+            changed["xl/theme/theme1.xml"] = ET.tostring(
+                theme, encoding="utf-8", xml_declaration=True,
+            )
+        for member in source.namelist():
+            if not re.fullmatch(r"xl/charts/chart\d+\.xml", member):
+                continue
+            chart = ET.fromstring(source.read(member))
+            language = chart.find("c:lang", ns)
+            if language is None:
+                raise ValueError("Historical chart lacks language metadata")
+            language.set("val", "zh-TW")
+            if artifact_role in ("full_a", "summary_a") and chart.find(".//c:barChart", ns) is not None:
+                # Both accepted A full/small statistics titles have the same
+                # native edge-position override; B/integrated are automatic.
+                title = chart.find("c:chart/c:title", ns)
+                title_layout = title.find("c:layout", ns)
+                if title_layout is None:
+                    title_layout = ET.Element(f"{{{ns['c']}}}layout")
+                    title.insert(1, title_layout)
+                title_layout.clear()
+                manual = ET.SubElement(title_layout, f"{{{ns['c']}}}manualLayout")
+                for field, value in (("xMode", "edge"), ("yMode", "edge"),
+                                     ("x", "0.3523162112572919"),
+                                     ("y", "0.027777777777777776")):
+                    ET.SubElement(manual, f"{{{ns['c']}}}{field}", {"val": value})
+            # XlsxWriter labels a whole mixed-script title en-US. The accepted
+            # files instead separate ASCII and Chinese runs, allowing +mn-ea
+            # to resolve against the Hant theme font rather than a US fallback.
+            for title in chart.findall("c:chart/c:title", ns):
+                rich = title.find("c:tx/c:rich", ns)
+                if rich is None:
+                    continue
+                for paragraph in rich.findall("a:p", ns):
+                    for run in list(paragraph.findall("a:r", ns)):
+                        text = run.find("a:t", ns)
+                        if text is None or text.text is None:
+                            continue
+                        index = list(paragraph).index(run)
+                        paragraph.remove(run)
+                        for offset, chunk in enumerate(re.findall(r"[\x00-\x7f]+|[^\x00-\x7f]+", text.text)):
+                            replacement = copy.deepcopy(run)
+                            properties = replacement.find("a:rPr", ns)
+                            if properties is None:
+                                properties = ET.Element(f"{{{ns['a']}}}rPr")
+                                replacement.insert(0, properties)
+                            ascii_run = chunk.isascii()
+                            properties.set("lang", "en-US" if ascii_run else "zh-TW")
+                            properties.set("altLang", "zh-TW" if ascii_run else "en-US")
+                            replacement.find("a:t", ns).text = chunk
+                            paragraph.insert(index + offset, replacement)
+                for body in rich.findall("a:bodyPr", ns):
+                    body.attrib.update({"rot": "0", "spcFirstLastPara": "1",
+                                        "vertOverflow": "ellipsis", "vert": "horz",
+                                        "wrap": "square", "anchor": "ctr", "anchorCtr": "1"})
+            # A/B theme tokens already reproduce all four native charts exactly.
+            # Integrated native references render Calibri, but XlsxWriter's
+            # theme tokens resolve to 新細明體 even with identical minor faces.
+            # A chart-text-only isolated native experiment proved literal
+            # Calibri fixes both images with zero numeric/series/geometry delta.
+            # Use this artifact-role compatibility strategy, not a port patch;
+            # keep worksheet Normal and the empty chart-parent default unchanged.
+            # Scope this normalization to text owners, not c:ser data/styles.
+            for properties in [*chart.findall(".//a:defRPr", ns),
+                               *chart.findall(".//a:rPr", ns)]:
+                if properties.find("a:latin", ns) is None:
+                    continue
+                for script, typeface in (("latin", "+mn-lt"),
+                                         ("ea", "+mn-ea"), ("cs", "+mn-cs")):
+                    font = properties.find(f"a:{script}", ns)
+                    if font is None:
+                        font = ET.SubElement(properties, f"{{{ns['a']}}}{script}")
+                    font.set("typeface", "Calibri" if artifact_role == "integrated" else typeface)
+            # Native references retain an empty chart-level default, not an
+            # extra forced 10pt font overriding the child-owner inheritance.
+            text_properties = chart.find("c:txPr", ns)
+            if text_properties is None:
+                text_properties = ET.Element(f"{{{ns['c']}}}txPr")
+                before = next((index for index, child in enumerate(chart)
+                               if child.tag in (f"{{{ns['c']}}}externalData",
+                                                f"{{{ns['c']}}}printSettings",
+                                                f"{{{ns['c']}}}extLst")), len(chart))
+                chart.insert(before, text_properties)
+            text_properties.clear()
+            ET.SubElement(text_properties, f"{{{ns['a']}}}bodyPr")
+            ET.SubElement(text_properties, f"{{{ns['a']}}}lstStyle")
+            paragraph = ET.SubElement(text_properties, f"{{{ns['a']}}}p")
+            properties = ET.SubElement(paragraph, f"{{{ns['a']}}}pPr")
+            ET.SubElement(properties, f"{{{ns['a']}}}defRPr")
+            ET.SubElement(paragraph, f"{{{ns['a']}}}endParaRPr", {"lang": "zh-TW"})
+            for end in chart.findall(".//a:endParaRPr", ns):
+                end.set("lang", "zh-TW")
+            changed[member] = ET.tostring(chart, encoding="utf-8", xml_declaration=True)
+        handle, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.layout-", suffix=".xlsx",
+                                                 dir=path.parent)
+        os.close(handle)
+        temporary = Path(temporary_name)
+        try:
+            with zipfile.ZipFile(temporary, "w", allowZip64=True) as destination:
+                for member in source.infolist():
+                    # ZipFile.open(..., 'w') mutates header_offset on ZipInfo.
+                    # Never reuse the source object's offset when stream-copying.
+                    # The known uncompressed file_size enables ZIP64 only when
+                    # needed, instead of adding ZIP64 headers to every tiny part.
+                    with destination.open(copy.copy(member), "w") as output:
+                        if member.filename in changed:
+                            output.write(changed[member.filename])
+                        else:
+                            with source.open(member) as original:
+                                shutil.copyfileobj(original, output, length=1024 * 1024)
+            # Windows cannot atomically replace an open ZIP. Close the authored
+            # source first, while retaining the job's existing resource lock.
+            source.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def _add_legacy_charts(
     workbook: xlsxwriter.Workbook,
     sheet: object,
@@ -3074,9 +3839,22 @@ def _add_legacy_charts(
     day_results: Sequence[DayResult],
     values: dict[tuple[date, str], float | None],
     stat_start: int,
+    stats_by_direction: dict[
+        str, tuple[float | None, float | None, float | None, float | None]
+    ],
+    scope_title: str,
+    artifact_role: str,
+    radar_helper_column: int | None = None,
 ) -> None:
+    layout = _historical_layout(artifact_role)
+    chart_direction_indexes = legacy_chart_direction_indexes(config)
+    text_color = "#595959"
+    text_font = "Calibri" if artifact_role == "integrated" else "新細明體"
+    grid_color = "#D9D9D9"
     radar = workbook.add_chart(_radar_options(config))
-    palette = ["#4472C4", "#ED7D31", "#70AD47", "#A5A5A5", "#FFC000", "#5B9BD5"]
+    radar_first_column = 1 if radar_helper_column is None else radar_helper_column
+    if radar_helper_column is not None:
+        radar.show_hidden_data()
     radar_days = [
         (offset, day_result) for offset, day_result in enumerate(day_results)
         if config.resolved_radar_style != "filled" or any(
@@ -3094,60 +3872,117 @@ def _add_legacy_charts(
             {
                 "name": "本時段無有效資料" if empty_period else f"{config.month}月{day_result.day.day}日",
                 "categories": ["總表", 0, 1, 0, 32],
-                "values": ["總表", row, 1, row, 32],
+                "values": ["總表", row, radar_first_column, row, radar_first_column + 31],
                 "values_data": [
                     values.get((day_result.day, direction)) if index in config.direction_indexes else None
                     for index, direction in enumerate(DIRECTION_ORDER)
                 ],
-                **_radar_series_style(config, palette[day_offset % len(palette)]),
+                **_radar_series_style(
+                    config,
+                    LEGACY_RADAR_PALETTE[day_offset % len(LEGACY_RADAR_PALETTE)],
+                ),
             }
         )
-    radar.set_title({"name": f"{config.year}-{config.month:02d} AIS通訊涵蓋圖"})
-    radar.set_legend({"position": "right", "font": {"size": 8}})
-    radar.set_size({"width": 760, "height": 480})
-    _configure_radar_axis(
-        radar, config,
-        (values.get((day.day, direction)) for day in day_results for direction in config.directions),
+    radar.set_title(
+        {
+            "name": f"{config.year}-{config.month} AIS通訊涵蓋圖",
+            "name_font": {"name": text_font, "color": text_color, "size": 14, "bold": False},
+        }
     )
-    sheet.insert_chart(stat_start + 6, 0, radar)
+    radar.set_legend(
+        {
+            "position": "right",
+            "font": {"name": text_font, "color": text_color, "size": 9},
+            "layout": dict(zip(("x", "y", "width", "height"), layout.radar_legend)),
+        }
+    )
+    radar.set_chartarea(
+        {"fill": {"color": "#FFFFFF"}, "border": {"color": "#D9D9D9", "width": 0.75}}
+    )
+    radar_plot_layout = (dict(zip(("x", "y", "width", "height"), layout.radar_plot))
+                         if layout.radar_plot is not None else None)
+    radar.set_plotarea(
+        {
+            "fill": {"color": "#FFFFFF"},
+            "border": {"none": True},
+            **({"layout": radar_plot_layout} if radar_plot_layout is not None else {}),
+        }
+    )
+    radar.set_x_axis(
+        {
+            "num_font": {"name": text_font, "color": text_color, "size": 9},
+            "line": {"color": grid_color, "width": 0.75},
+            # XlsxWriter radar defaults to category major gridlines (spokes).
+            # The accepted A artifact has them; B/integrated do not. Axis
+            # shape fill is not the same property as axis line/gridlines.
+            "major_gridlines": {
+                "visible": artifact_role in ("full_a", "summary_a"),
+                "line": {"color": grid_color, "width": 0.75},
+            },
+        }
+    )
+    radar_values = (
+        values.get((day.day, direction))
+        for day in day_results
+        for direction in config.directions
+    )
+    _validate_radar_max(config, radar_values)
+    radar.show_blanks_as("gap")
+    radar_y_axis: dict[str, object] = {
+        "num_format": "0.0000" if artifact_role == "integrated" else "General",
+        "num_format_linked": True,
+        "num_font": {"name": text_font, "color": text_color, "size": 9},
+        "major_gridlines": {
+            "visible": True,
+            "line": {"color": grid_color, "width": 0.75},
+        },
+        "line": {"none": True},
+    }
+    if config.radar_max is not None:
+        radar_y_axis.update({"min": 0, "max": config.radar_max})
+    radar.set_y_axis(radar_y_axis)
+    # Staging dimensions only. Exact reference cell/EMU vertices are normalized
+    # after close, independently of XlsxWriter's Calibri-only pixel metric.
+    radar.set_size({"width": 704, "height": 598})
+    sheet.insert_chart(
+        1,
+        11,
+        radar,
+        {"object_position": 1},
+    )
 
     helper_column = 34
-    sheet.write(0, helper_column, "納入方位")
-    sheet.write_row(0, helper_column + 1, ["MAX", "MIN", "AVERAGE"])
-    stat_values = {
-        direction: _stats(
-            values.get((day_result.day, direction)) for day_result in day_results
-        )
-        for direction in DIRECTION_ORDER
-    }
-    for helper_row, direction_index in enumerate(config.direction_indexes, start=1):
-        direction = DIRECTION_ORDER[direction_index]
-        sheet.write(helper_row, helper_column, LEGACY_DIRECTION_ABBREVIATIONS[direction_index])
-        for offset in range(3):
-            value = stat_values[direction][offset]
-            if value is not None:
-                sheet.write_number(helper_row, helper_column + 1 + offset, value)
-    sheet.set_column(helper_column, helper_column + 3, None, None, {"hidden": True})
-
     columns = workbook.add_chart({"type": "column"})
-    categories = ["總表", 1, helper_column, len(config.direction_indexes), helper_column]
+    categories = ["總表", 1, helper_column, len(chart_direction_indexes), helper_column]
+    categories_data = [
+        LEGACY_DIRECTION_ABBREVIATIONS[index] for index in chart_direction_indexes
+    ]
     for label, helper_offset, color in (
-        ("最遠距離", 1, "#4472C4"),
-        ("最近距離", 2, "#ED7D31"),
+        ("MAX", 1, "#00B0F0"),
+        ("MIN", 2, "#ED7D31"),
     ):
         columns.add_series(
             {
                 "name": label,
                 "categories": categories,
+                "categories_data": categories_data,
                 "values": [
                     "總表",
                     1,
                     helper_column + helper_offset,
-                    len(config.direction_indexes),
+                    len(chart_direction_indexes),
                     helper_column + helper_offset,
+                ],
+                "values_data": [
+                    stats_by_direction[DIRECTION_ORDER[index]][helper_offset - 1]
+                    for index in chart_direction_indexes
                 ],
                 "fill": {"color": color},
                 "border": {"none": True},
+                # All five accepted June artifacts use a 219% category gap
+                # and -27% series overlap, not Excel's defaults 150% and 0%.
+                "gap": 219,
+                "overlap": -27,
             }
         )
     line = workbook.add_chart({"type": "line"})
@@ -3155,22 +3990,72 @@ def _add_legacy_charts(
         {
             "name": "平均值",
             "categories": categories,
+            "categories_data": categories_data,
             "values": [
                 "總表",
                 1,
                 helper_column + 3,
-                len(config.direction_indexes),
+                len(chart_direction_indexes),
                 helper_column + 3,
             ],
-            "line": {"color": "#70AD47", "width": 2.0},
+            "values_data": [
+                stats_by_direction[DIRECTION_ORDER[index]][2]
+                for index in chart_direction_indexes
+            ],
+            "line": {"color": "#FF0000", "width": 2.25},
+            "marker": {"type": "none"},
         }
     )
     columns.combine(line)
-    columns.set_title({"name": f"{config.year}-{config.month:02d} AIS通訊最遠、最近與平均距離（NM）"})
-    columns.set_legend({"position": "bottom"})
-    columns.set_y_axis({"name": "NM", "num_format": "0"})
-    columns.set_size({"width": 760, "height": 480})
-    sheet.insert_chart(stat_start + 31, 0, columns)
+    columns.show_hidden_data()
+    columns.set_title(
+        {
+            "name": f"{config.year}-{config.month:02d} AIS通訊最近最遠距離(浬)",
+            "name_font": {"name": text_font, "color": text_color, "size": 14, "bold": False},
+        }
+    )
+    columns.set_legend(
+        {"position": "bottom", "font": {"name": text_font, "color": text_color, "size": 9}}
+    )
+    columns.set_chartarea(
+        {"fill": {"color": "#FFFFFF"}, "border": {"color": "#D9D9D9", "width": 0.75}}
+    )
+    columns.set_plotarea(
+        {
+            "fill": {"color": "#FFFFFF"},
+            "border": {"none": True},
+        }
+    )
+    columns.set_y_axis(
+        {
+            "num_format": "0.0000" if artifact_role == "integrated" else "General",
+            "num_format_linked": True,
+            "num_font": {"name": text_font, "color": text_color, "size": 9},
+            "major_tick_mark": "none",
+            "minor_tick_mark": "none",
+            "major_gridlines": {
+                "visible": True,
+                "line": {"color": grid_color, "width": 0.75},
+            },
+            "line": {"none": True},
+        }
+    )
+    columns.set_x_axis(
+        {
+            "num_font": {"name": text_font, "color": text_color, "size": 9, "rotation": 0},
+            "line": {"color": "#D9D9D9", "width": 0.75},
+            "major_tick_mark": "none",
+            "minor_tick_mark": "none",
+        }
+    )
+    columns.set_size({"width": 993, "height": 275})
+    # Reference anchor is A44 for a 30-day month, i.e. stat_start + 11.
+    sheet.insert_chart(
+        stat_start + 11,
+        0,
+        columns,
+        {"object_position": 1},
+    )
 
 
 def _write_delivery_summary_sheet(
@@ -3181,59 +4066,159 @@ def _write_delivery_summary_sheet(
     *,
     daily_names: dict[date, str] | None = None,
     integrated_formula: bool = False,
+    scope_title: str,
+    artifact_role: str,
 ) -> None:
+    _historical_layout(artifact_role)
     sheet = workbook.add_worksheet("總表")
     sheet.freeze_panes(1, 1)
-    sheet.set_column("A:A", 11)
-    sheet.set_column("B:AG", 10)
-    header_format = workbook.add_format({"bold": True, "align": "center", "bottom": 1})
-    number_format = workbook.add_format({"num_format": "0.000"})
-    date_format = workbook.add_format({"num_format": "m月d日"})
-    stat_label = workbook.add_format({"bold": True})
-    sheet.write_row(0, 1, LEGACY_DIRECTION_ABBREVIATIONS, header_format)
-    for row, day_result in enumerate(day_results, start=1):
-        sheet.write_datetime(row, 0, datetime.combine(day_result.day, datetime.min.time()), date_format)
-        for direction_index, direction in enumerate(DIRECTION_ORDER):
-            column = 1 + direction_index
-            value = values.get((day_result.day, direction))
-            if direction_index not in config.direction_indexes:
-                sheet.write_blank(row, column, None, number_format)
-            elif integrated_formula:
-                excel_row = row + 1
-                column_name = _excel_col(column)
-                formula = (
-                    f'=IF(COUNT(\'Period A\'!{column_name}{excel_row},\'Period B\'!{column_name}{excel_row})=0,"",'
-                    f'MAX(\'Period A\'!{column_name}{excel_row},\'Period B\'!{column_name}{excel_row}))'
-                )
-                sheet.write_formula(row, column, formula, number_format, value if value is not None else "")
-            elif daily_names is not None:
-                source_column = _excel_col(7 + direction_index)
-                formula = f"=IFERROR('{daily_names[day_result.day]}'!{source_column}2,\"\")"
-                sheet.write_formula(row, column, formula, number_format, value if value is not None else "")
-            elif value is None:
-                sheet.write_blank(row, column, None, number_format)
-            else:
-                sheet.write_number(row, column, value, number_format)
-
+    sheet.set_column("A:A", 14.57)
+    header_format = workbook.add_format({"valign": "vcenter"})
+    # Axis sourceLinked=1 resolves its final tick format from the actual chart
+    # source cells, not merely c:numFmt in the chart XML. Match the reference
+    # A/B General and integrated four-decimal cells, including hidden helpers.
+    number_format = workbook.add_format({
+        "num_format": "0.0000" if artifact_role == "integrated" else "General",
+    })
+    date_format = workbook.add_format({"num_format": 'm"月"d"日"', "valign": "vcenter"})
+    stat_label = workbook.add_format({"valign": "vcenter"})
+    stat_number_format = workbook.add_format({
+        "num_format": "0.0000" if artifact_role == "integrated" else "General",
+        "valign": "vcenter",
+    })
+    helper_column = 34
     stat_start = len(day_results) + 2
     stat_specs = [("MAX", "MAX", 0), ("MIN", "MIN", 1), ("平均值", "AVERAGE", 2), ("標準差", "_xlfn.STDEV.S", 3)]
     stats_by_direction = {
         direction: _stats(values.get((item.day, direction)) for item in day_results)
         for direction in DIRECTION_ORDER
     }
-    for offset, (label, function, stat_index) in enumerate(stat_specs):
-        row = stat_start + offset
-        sheet.write(row, 0, label, stat_label)
-        for direction_index, direction in enumerate(DIRECTION_ORDER):
-            column = 1 + direction_index
-            if direction_index not in config.direction_indexes:
-                sheet.write_blank(row, column, None, number_format)
-                continue
-            column_name = _excel_col(column)
-            formula = f'=IFERROR({function}({column_name}2:{column_name}{len(day_results) + 1}),"")'
-            cached = stats_by_direction[direction][stat_index]
-            sheet.write_formula(row, column, formula, number_format, cached if cached is not None else "")
-    _add_legacy_charts(workbook, sheet, config, day_results, values, stat_start)
+    chart_direction_indexes = legacy_chart_direction_indexes(config)
+    sheet.set_column(helper_column, helper_column + 3, None, None, {"hidden": True})
+    sheet.write_row(0, 1, LEGACY_DIRECTION_ABBREVIATIONS, header_format)
+    sheet.write(0, helper_column, "納入方位")
+    sheet.write_row(0, helper_column + 1, ["MAX", "MIN", "AVERAGE"])
+
+    # Full A/B and integrated summaries use formula-backed primary daily cells.
+    # Excel treats formula "" as a plotted zero even in gap mode. Plain numeric
+    # /true-blank summaries do not have this defect. Keep primary semantics and
+    # approved layout untouched, with a dynamic chart-only missing vector only
+    # when the actual source kind requires it (not a port-specific patch).
+    radar_helper_column = 40 if daily_names is not None or integrated_formula else None
+    if radar_helper_column is not None:
+        sheet.set_column(radar_helper_column, radar_helper_column + 31, None, None, {"hidden": True})
+        sheet.write_row(0, radar_helper_column, LEGACY_DIRECTION_ABBREVIATIONS)
+
+    # constant_memory keeps only the current row. Finish A:AL for each row
+    # before advancing so the hidden chart helper cells aren't discarded as
+    # attempted backwrites after the visible table and statistics.
+    final_row = max(
+        len(day_results),
+        len(chart_direction_indexes),
+        stat_start + len(stat_specs) - 1,
+    )
+    for row in range(1, final_row + 1):
+        if row <= len(day_results):
+            day_result = day_results[row - 1]
+            sheet.write_datetime(
+                row, 0, datetime.combine(day_result.day, datetime.min.time()), date_format
+            )
+            for direction_index, direction in enumerate(DIRECTION_ORDER):
+                column = 1 + direction_index
+                value = values.get((day_result.day, direction))
+                if direction_index not in config.direction_indexes:
+                    sheet.write_blank(row, column, None, number_format)
+                elif integrated_formula:
+                    excel_row = row + 1
+                    column_name = _excel_col(column)
+                    formula = (
+                        f'=IF(COUNT(\'Period A\'!{column_name}{excel_row},'
+                        f'\'Period B\'!{column_name}{excel_row})=0,"",'
+                        f'MAX(\'Period A\'!{column_name}{excel_row},'
+                        f'\'Period B\'!{column_name}{excel_row}))'
+                    )
+                    sheet.write_formula(
+                        row,
+                        column,
+                        formula,
+                        number_format,
+                        value if value is not None else "",
+                    )
+                elif daily_names is not None:
+                    source_column = _excel_col(7 + direction_index)
+                    source_reference = (
+                        f"'{daily_names[day_result.day]}'!{source_column}2"
+                    )
+                    formula = _excel_numeric_reference_or_blank(source_reference)
+                    sheet.write_formula(
+                        row,
+                        column,
+                        formula,
+                        number_format,
+                        value if value is not None else "",
+                    )
+                elif value is None:
+                    sheet.write_blank(row, column, None, number_format)
+                else:
+                    sheet.write_number(row, column, value, number_format)
+
+        stat_offset = row - stat_start
+        if 0 <= stat_offset < len(stat_specs):
+            label, function, stat_index = stat_specs[stat_offset]
+            sheet.write(row, 0, label, stat_label)
+            for direction_index, direction in enumerate(DIRECTION_ORDER):
+                column = 1 + direction_index
+                if direction_index not in config.direction_indexes:
+                    sheet.write_blank(row, column, None, stat_number_format)
+                    continue
+                column_name = _excel_col(column)
+                stat_reference = (
+                    f"{column_name}2:{column_name}{len(day_results) + 1}"
+                )
+                formula = _excel_stat_or_blank(function, stat_reference)
+                cached = stats_by_direction[direction][stat_index]
+                sheet.write_formula(
+                    row,
+                    column,
+                    formula,
+                    stat_number_format,
+                    cached if cached is not None else "",
+                )
+
+        if row <= len(chart_direction_indexes):
+            direction_index = chart_direction_indexes[row - 1]
+            direction = DIRECTION_ORDER[direction_index]
+            sheet.write(
+                row, helper_column, LEGACY_DIRECTION_ABBREVIATIONS[direction_index]
+            )
+            for offset in range(3):
+                value = stats_by_direction[direction][offset]
+                if value is not None:
+                    sheet.write_number(row, helper_column + 1 + offset, value, number_format)
+
+        # Complete helpers in the same row before a constant_memory sheet moves
+        # forward; never backwrite or fabricate zero for an excluded direction.
+        if radar_helper_column is not None and row <= len(day_results):
+            day_result = day_results[row - 1]
+            for direction_index, direction in enumerate(DIRECTION_ORDER):
+                source = f"{_excel_col(1 + direction_index)}{row + 1}"
+                value = values.get((day_result.day, direction)) if direction_index in config.direction_indexes else None
+                sheet.write_formula(row, radar_helper_column + direction_index,
+                                    _excel_chart_reference_or_na(source), number_format,
+                                    value if value is not None else "#N/A")
+
+    _add_legacy_charts(
+        workbook,
+        sheet,
+        config,
+        day_results,
+        values,
+        stat_start,
+        stats_by_direction,
+        scope_title,
+        artifact_role,
+        radar_helper_column,
+    )
 
 
 def _write_period_full_workbook(
@@ -3244,6 +4229,9 @@ def _write_period_full_workbook(
     values: dict[tuple[date, str], float | None],
     cancel_event: threading.Event | None,
 ) -> None:
+    if scope not in (PERIOD_A, PERIOD_B):
+        raise ValueError(f"未識別的 Historical period：{scope!r}")
+    artifact_role = "full_a" if scope == PERIOD_A else "full_b"
     workbook = xlsxwriter.Workbook(
         path,
         {"constant_memory": True, "nan_inf_to_errors": True, "default_date_format": "m月d日"},
@@ -3340,7 +4328,17 @@ def _write_period_full_workbook(
                     )
 
         _write_delivery_summary_sheet(
-            workbook, config, day_results, values, daily_names=daily_names
+            workbook,
+            config,
+            day_results,
+            values,
+            daily_names=daily_names,
+            artifact_role=artifact_role,
+            scope_title=(
+                "Historical Period A 00:00–11:59"
+                if scope == PERIOD_A
+                else "Historical Period B 12:00–23:59"
+            ),
         )
         mapping = workbook.add_worksheet("工作")
         mapping.write_row(0, 9, ["POSITION", "方位"], header_format)
@@ -3356,6 +4354,7 @@ def _write_period_full_workbook(
         except Exception:
             pass
         raise
+    _apply_historical_geometry(path, artifact_role, len(day_results))
 
 
 def _write_summary_workbook(
@@ -3364,12 +4363,19 @@ def _write_summary_workbook(
     day_results: Sequence[DayResult],
     values: dict[tuple[date, str], float | None],
     *,
+    scope_title: str,
+    artifact_role: str,
     integrated_inputs: tuple[
         dict[tuple[date, str], float | None],
         dict[tuple[date, str], float | None],
     ]
     | None = None,
 ) -> None:
+    _historical_layout(artifact_role)
+    if artifact_role not in ("summary_a", "summary_b", "integrated"):
+        raise ValueError("Summary writer requires a summary/integrated artifact role")
+    if (artifact_role == "integrated") != (integrated_inputs is not None):
+        raise ValueError("Integrated role and period inputs must agree")
     workbook = xlsxwriter.Workbook(path, {"nan_inf_to_errors": True})
     workbook.set_calc_mode("auto")
     _write_policy_properties(workbook, config)
@@ -3390,10 +4396,14 @@ def _write_summary_workbook(
         day_results,
         values,
         integrated_formula=integrated_inputs is not None,
+        scope_title=scope_title,
+        artifact_role=artifact_role,
     )
     workbook.close()
+    _apply_historical_geometry(path, artifact_role, len(day_results))
 
 
+@_guarded_job
 def write_delivery_workbooks(
     config: AppConfig,
     day_results: Sequence[DayResult],
@@ -3406,18 +4416,7 @@ def write_delivery_workbooks(
     paths = derive_delivery_paths(config, root)
     paths.root.mkdir(parents=True, exist_ok=True)
     final_files = paths.all_files()
-    rollback_paths = {
-        path: path.with_name(f".{path.name}.rollback") for path in final_files
-    }
-    for final_path, rollback_path in rollback_paths.items():
-        if not rollback_path.exists():
-            continue
-        if final_path.exists():
-            raise FileExistsError(
-                f"偵測到未完成的五檔替換且新舊檔並存：{rollback_path.name}；"
-                "請先保留現況並人工確認。"
-            )
-        os.replace(rollback_path, final_path)
+    _recover_output_backups(final_files)
     validate_decision_snapshot_contract(snapshot, config, day_results)
     if not config.overwrite:
         existing = [path for path in final_files if path.exists()]
@@ -3451,8 +4450,6 @@ def write_delivery_workbooks(
     }
     for temp_path in temporary.values():
         temp_path.unlink(missing_ok=True)
-    backed_up: dict[Path, Path] = {}
-    promoted: list[Path] = []
     try:
         emit(callback, kind="delivery_write_start", files=[path.name for path in final_files])
         _write_period_full_workbook(
@@ -3464,11 +4461,21 @@ def write_delivery_workbooks(
         )
         emit(callback, kind="delivery_file_done", position=2, total=5, file=paths.period_a_full.name)
         _write_summary_workbook(
-            temporary[paths.period_b_summary], config, day_results, period_b
+            temporary[paths.period_b_summary],
+            config,
+            day_results,
+            period_b,
+            scope_title="Historical Period B 12:00–23:59",
+            artifact_role="summary_b",
         )
         emit(callback, kind="delivery_file_done", position=3, total=5, file=paths.period_b_summary.name)
         _write_summary_workbook(
-            temporary[paths.period_a_summary], config, day_results, period_a
+            temporary[paths.period_a_summary],
+            config,
+            day_results,
+            period_a,
+            scope_title="Historical Period A 00:00–11:59",
+            artifact_role="summary_a",
         )
         emit(callback, kind="delivery_file_done", position=4, total=5, file=paths.period_a_summary.name)
         _write_summary_workbook(
@@ -3476,42 +4483,21 @@ def write_delivery_workbooks(
             config,
             day_results,
             integrated,
+            scope_title="Historical Period A/B 整合 MAX",
+            artifact_role="integrated",
             integrated_inputs=(period_a, period_b),
         )
         emit(callback, kind="delivery_file_done", position=5, total=5, file=paths.integrated_summary.name)
-        for final_path in final_files:
-            if final_path.exists():
-                rollback_path = rollback_paths[final_path]
-                os.replace(final_path, rollback_path)
-                backed_up[final_path] = rollback_path
-        for final_path in final_files:
-            os.replace(temporary[final_path], final_path)
-            promoted.append(final_path)
-    except Exception as error:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("已取消；五份 Historical 正式輸出均未替換。")
+        _promote_output_set(temporary, overwrite=config.overwrite)
+    except BaseException:
         for temp_path in temporary.values():
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        rollback_errors: list[str] = []
-        for final_path in promoted:
-            try:
-                final_path.unlink(missing_ok=True)
-            except OSError as rollback_error:
-                rollback_errors.append(f"移除 {final_path.name}: {rollback_error}")
-        for final_path, rollback_path in backed_up.items():
-            try:
-                if rollback_path.exists():
-                    os.replace(rollback_path, final_path)
-            except OSError as rollback_error:
-                rollback_errors.append(f"還原 {final_path.name}: {rollback_error}")
-        if rollback_errors:
-            raise RuntimeError(
-                "五檔替換失敗且自動回復不完整：" + "；".join(rollback_errors)
-            ) from error
         raise
-    for rollback_path in backed_up.values():
-        rollback_path.unlink(missing_ok=True)
     emit(callback, kind="delivery_write_done", files=[str(path) for path in final_files])
     return paths
 
@@ -3594,6 +4580,7 @@ def load_finalization_results(config: AppConfig) -> list[DayResult]:
     return results
 
 
+@_guarded_review_job
 def finalize_review_workbook(
     reviewed_workbook: Path,
     *,
@@ -3607,6 +4594,7 @@ def finalize_review_workbook(
         delivery_dir=delivery_dir,
         overwrite=overwrite,
     )
+    source_preflight, source_preflight_path = require_safe_source_preflight(config,callback,cancel_event)
     job = build_processing_job(config)
     required, free = preflight_output_space(
         config,
@@ -3627,6 +4615,10 @@ def finalize_review_workbook(
         raise ValueError("覆核 decision ledger 與 workbook metadata 的港別／月份不一致。")
     validate_decision_snapshot_contract(snapshot, config, day_results)
     resolve_decision_values(snapshot, day_results, config)
+    try:
+        verify_source_identity(source_preflight)
+    except (ValueError,OSError) as error:
+        raise SourcePreflightError(f"來源在覆核重生前變更：{error}",source_preflight_path) from error
     return write_delivery_workbooks(
         config,
         day_results,
@@ -3637,6 +4629,7 @@ def finalize_review_workbook(
     )
 
 
+@_guarded_job
 def run_pipeline(
     config: AppConfig,
     callback: ProgressCallback | None = None,
@@ -3645,21 +4638,43 @@ def run_pipeline(
     started = time.perf_counter()
     day_results, warnings = process_month(config, callback=callback, cancel_event=cancel_event)
     snapshot = build_default_decision_snapshot(config, day_results)
-    output = write_monthly_workbook(
-        config,
-        day_results,
-        warnings,
-        snapshot,
-        callback=callback,
-        cancel_event=cancel_event,
-    )
-    delivery = write_delivery_workbooks(
-        config,
-        day_results,
-        snapshot,
-        callback=callback,
-        cancel_event=cancel_event,
-    )
+    delivery = derive_delivery_paths(config)
+    final_files = (config.output_path, *delivery.all_files())
+    _recover_output_backups(final_files)
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    delivery.root.mkdir(parents=True, exist_ok=True)
+    with contextlib.ExitStack() as stage_context:
+        modern_stage = Path(stage_context.enter_context(
+            tempfile.TemporaryDirectory(prefix=".ais32-stage-", dir=config.output_path.parent)
+        ))
+        delivery_stage = Path(stage_context.enter_context(
+            tempfile.TemporaryDirectory(prefix=".ais32-stage-", dir=delivery.root)
+        ))
+        staged_modern = write_monthly_workbook(
+            config,
+            day_results,
+            warnings,
+            snapshot,
+            callback=callback,
+            cancel_event=cancel_event,
+            _staging_path=modern_stage / "Modern.xlsx",
+        )
+        staged_delivery = write_delivery_workbooks(
+            config,
+            day_results,
+            snapshot,
+            root=delivery_stage,
+            callback=callback,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("已取消；六份正式輸出均未替換。")
+        staged_files = {
+            config.output_path: staged_modern,
+            **dict(zip(delivery.all_files(), staged_delivery.all_files())),
+        }
+        _promote_output_set(staged_files, overwrite=config.overwrite)
+    output = config.output_path
     files = [str(output), *(str(path) for path in delivery.all_files())]
     emit(callback, kind="complete", file=str(output), files=files, seconds=time.perf_counter() - started)
     return output
@@ -3733,10 +4748,74 @@ def friendly_error_message(error: BaseException) -> str:
     )
 
 
+def error_category(error: BaseException) -> str:
+    """Shared classification, independent of CLI/GUI presentation."""
+    if isinstance(error,CancelledError):
+        return "CANCELLED"
+    if isinstance(error,SourcePreflightError):
+        return "SOURCE_PREFLIGHT_BLOCKED"
+    if isinstance(error,SourceFileError):
+        return "SOURCE_FILE_ERROR"
+    if isinstance(error,(zipfile.BadZipFile,openpyxl.utils.exceptions.InvalidFileException)):
+        return "SOURCE_READ_ERROR"
+    if isinstance(error,(ValueError,FileExistsError)):
+        return "CONFIGURATION_ERROR"
+    if isinstance(error,OSError):
+        return "IO_ERROR"
+    return "UNEXPECTED_ERROR"
+
+
+def report_cli_failure(error: BaseException, argv: Sequence[str]) -> int:
+    """Never rethrow from presentation, including a windowed EXE with no stdio."""
+    def option(name):
+        for position,item in enumerate(argv):
+            if item==name and position+1<len(argv):
+                return argv[position+1]
+            if item.startswith(name+"="):
+                return item.split("=",1)[1]
+        return None
+    category = error_category(error)
+    code = 3 if category=="CANCELLED" else 2 if category.startswith("SOURCE_") or category=="CONFIGURATION_ERROR" else 1
+    payload = {"status":"FAIL","category":category,"exit_code":code,"application_version":APP_VERSION,
+               "reason":friendly_error_message(error),"error_type":type(error).__name__,
+               "preflight_report":str(error.report_path) if isinstance(error,SourcePreflightError) else None,
+               "argv":list(argv),"traceback":"".join(traceback.format_exception(type(error),error,error.__traceback__)),
+               "boundary":"Failed invocation; no success marker. Existing official outputs, if any, are not evidence of this invocation succeeding."}
+    output,source = option("--output"),option("--input")
+    parents = []
+    try:
+        if output:
+            parent = Path(output).resolve().parent
+            source_root = Path(source).resolve() if source else None
+            if source_root is None or (parent!=source_root and source_root not in parent.parents):
+                parents.append(parent)
+    except (OSError,ValueError):
+        pass
+    parents.append(Path(tempfile.gettempdir())/"AIS32_cli_errors")
+    payload["error_log"] = None
+    for parent in parents:
+        try:
+            parent.mkdir(parents=True,exist_ok=True)
+            target = parent/f"AIS32_CLI_FAILURE_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex}.json"
+            payload["error_log"] = str(target)
+            with target.open("x",encoding="utf-8") as stream:
+                json.dump(payload,stream,ensure_ascii=False,indent=2)
+            break
+        except Exception:
+            payload["error_log"] = None
+    if sys.stderr is not None:
+        try:
+            sys.stderr.write("AIS32_CLI_FAILURE "+json.dumps(payload,ensure_ascii=True)+"\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    return code
+
+
 def write_error_report(config: AppConfig, error: BaseException) -> Path | None:
     try:
         config.output_path.parent.mkdir(parents=True, exist_ok=True)
-        report = config.output_path.parent / f"AIS月報_錯誤報告_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        report = config.output_path.parent / f"AIS月報_錯誤報告_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.txt"
         try:
             discovered, _warnings = discover_source_files(config.input_dir, config.port)
             month_inputs = [
@@ -3746,12 +4825,13 @@ def write_error_report(config: AppConfig, error: BaseException) -> Path | None:
             ]
             source_days: int | str = len(month_inputs)
             fragment_count: int | str = sum(len(item.fragments) for item in month_inputs)
-        except (OSError, ValueError):
+        except (OSError, ValueError, SourceFileError):
             source_days = "無法判定"
             fragment_count = "無法判定"
         contents = [
             APP_TITLE,
             f"版本：{APP_VERSION}",
+            f"錯誤分類：{error_category(error)}",
             f"時間：{datetime.now():%Y-%m-%d %H:%M:%S}",
             f"來源：{config.input_dir}",
             f"港別：{config.port}",
@@ -3769,7 +4849,7 @@ def write_error_report(config: AppConfig, error: BaseException) -> Path | None:
         ]
         report.write_text("\n".join(contents), encoding="utf-8-sig")
         return report
-    except OSError:
+    except Exception:
         return None
 
 
@@ -3893,7 +4973,7 @@ def launch_gui() -> None:
             ttk.Label(config_box, text="雷達刻度上限 NM（留空自動）").grid(row=5, column=2, columnspan=3, sticky="w", padx=(10, 0), pady=(8, 0))
             ttk.Entry(config_box, textvariable=self.radar_max_var, width=12).grid(row=6, column=2, sticky="w", padx=(10, 0))
             ttk.Label(config_box,
-                      text="auto：KLNG 使用歷史 21 方位＋線形；其他港別全部 32 方位＋填色。all32 不套地理遮罩，非已驗證海向政策。刻度不影響距離篩選。",
+                      text="auto：KLNG 使用歷史 21 方位、其他港別全部 32 方位；雷達均以六月確認成果的填色格式輸出。all32 不套地理遮罩，非已驗證海向政策。刻度不影響距離篩選。",
                       foreground="#5B6573", wraplength=820).grid(row=7, column=0, columnspan=5, sticky="w", pady=(5, 0))
 
             run_box = ttk.LabelFrame(container, text="3  一鍵執行", style="Section.TLabelframe")
@@ -3960,7 +5040,7 @@ def launch_gui() -> None:
                 self.month_options = {}
                 self.month_combo.configure(values=[])
                 self.month_choice_var.set("找不到固定格式的每日檔")
-                self.status_var.set("找不到符合 D&TMOK <PORT>_YYYYMMDD_*.xlsx 格式的檔案。")
+                self.status_var.set("找不到符合 D&TMOK <PORT>_YYYYMMDD_*.xlsx（個位日期亦接受 YYYYMMd）格式的檔案。")
                 if announce:
                     self.append_log(self.status_var.get())
                 return
@@ -4077,7 +5157,7 @@ def launch_gui() -> None:
             output = Path(output_text)
             detected = detect_source_catalog(source)
             if not detected:
-                raise ValueError("找不到符合 D&TMOK <PORT>_YYYYMMDD_*.xlsx 格式的檔案。")
+                raise ValueError("找不到符合 D&TMOK <PORT>_YYYYMMDD_*.xlsx（個位日期亦接受 YYYYMMd）格式的檔案。")
             port = self.port_choice_var.get()
             if port not in detected:
                 self.refresh_detected_sources(source, announce=True, update_output=False)
@@ -4102,10 +5182,12 @@ def launch_gui() -> None:
                 top_candidates=int(self.top_var.get()),
                 message_types=parse_message_types(self.message_types_var.get()),
                 workers=int(self.workers_var.get()),
-                overwrite=True,
+                overwrite=False,
             )
 
         def start(self) -> None:
+            if self.worker is not None and self.worker.is_alive():
+                return
             try:
                 config = self.build_config()
                 delivery = derive_delivery_paths(config)
@@ -4118,7 +5200,12 @@ def launch_gui() -> None:
                     listing = "\n".join(str(path) for path in existing)
                     if not messagebox.askyesno("覆寫確認", f"下列檔案已存在：\n{listing}\n\n要覆寫嗎？"):
                         return
+                config.overwrite = bool(existing)
                 config.validate()
+                # Source discovery can still fail after build_config/validate.
+                # Complete it before changing controls or creating a worker.
+                job = build_processing_job(config)
+                fragment_count = sum(len(day_input.fragments) for day_input in job.days)
             except Exception as error:
                 messagebox.showerror("設定錯誤", str(error))
                 return
@@ -4132,12 +5219,9 @@ def launch_gui() -> None:
             self.progress["value"] = 0
             self.status_var.set("開始處理…")
             self.progress_text_var.set("正在準備來源檔")
-            selected = self.month_options.get(self.month_choice_var.get())
-            source_count = selected[2] if selected is not None else 0
+            source_count = len(job.days)
             self.append_log(f"Port: {config.port}")
             self.append_log(f"Period: {config.year}-{config.month:02d}")
-            job = build_processing_job(config)
-            fragment_count = sum(len(day_input.fragments) for day_input in job.days)
             self.append_log(f"Logical days: {source_count}")
             self.append_log(f"Source fragments: {fragment_count}")
             self.append_log(config.direction_policy_description)
@@ -4167,6 +5251,7 @@ def launch_gui() -> None:
                     self.events.put(
                         {
                             "kind": "worker_error",
+                            "category": error_category(error),
                             "error": friendly_error_message(error),
                             "technical": f"{type(error).__name__}: {error}",
                             "report": str(report) if report else None,
@@ -4177,6 +5262,8 @@ def launch_gui() -> None:
             self.worker.start()
 
         def finalize_review(self) -> None:
+            if self.worker is not None and self.worker.is_alive():
+                return
             reviewed = filedialog.askopenfilename(
                 title="選擇已覆核的新版分析 workbook",
                 filetypes=[("Excel 活頁簿", "*.xlsx")],
@@ -4185,7 +5272,7 @@ def launch_gui() -> None:
                 return
             reviewed_path = Path(reviewed)
             try:
-                config = config_from_review_workbook(reviewed_path, overwrite=True)
+                config = config_from_review_workbook(reviewed_path, overwrite=False)
                 delivery = derive_delivery_paths(config)
                 existing = [path for path in delivery.all_files() if path.exists()]
                 if existing:
@@ -4195,6 +5282,8 @@ def launch_gui() -> None:
                         f"將依同一份 decision ledger 重新產生並覆寫：\n{listing}\n\n要繼續嗎？",
                     ):
                         return
+                confirmed_overwrite = bool(existing)
+                config.overwrite = confirmed_overwrite
             except Exception as error:
                 messagebox.showerror("覆核檔錯誤", str(error))
                 return
@@ -4219,7 +5308,7 @@ def launch_gui() -> None:
                 try:
                     completed = finalize_review_workbook(
                         reviewed_path,
-                        overwrite=True,
+                        overwrite=confirmed_overwrite,
                         callback=callback,
                         cancel_event=self.cancel_event,
                     )
@@ -4239,6 +5328,7 @@ def launch_gui() -> None:
                     self.events.put(
                         {
                             "kind": "worker_error",
+                            "category": error_category(error),
                             "error": friendly_error_message(error),
                             "technical": f"{type(error).__name__}: {error}",
                             "report": str(report) if report else None,
@@ -4265,6 +5355,14 @@ def launch_gui() -> None:
                         self.status_var.set(f"處理第 {position}/{total} 個 logical day：{payload['file']}")
                         self.progress_text_var.set("正在逐列讀取並保留各方位候選值")
                         self.append_log(self.status_var.get())
+                    elif kind == "source_preflight_start":
+                        self.status_var.set("正在完整預檢來源；尚未進入數值處理…")
+                        self.append_log(self.status_var.get())
+                    elif kind == "source_preflight_progress":
+                        self.progress_text_var.set(f"來源預檢：{payload['completed_days']}/{payload['total_days']} 個 logical days")
+                    elif kind == "source_preflight_done":
+                        self.append_log(f"來源預檢 {payload['status']}：{payload['report']}")
+                        self.status_var.set("來源預檢完成，準備月份處理…")
                     elif kind == "preflight":
                         required = int(payload["required_bytes"]) / 1024**3
                         free_value = payload.get("free_bytes")
@@ -4339,6 +5437,7 @@ def launch_gui() -> None:
                     elif kind == "worker_error":
                         self.status_var.set("製作失敗；請看下方錯誤。")
                         self.append_log(payload.get("technical", payload["error"]))
+                        self.append_log(f"錯誤分類：{payload.get('category','UNEXPECTED_ERROR')}")
                         if payload.get("report"):
                             self.append_log(f"錯誤報告：{payload['report']}")
                         self.start_button.configure(state="normal")
@@ -4361,7 +5460,13 @@ def cli_progress(payload: dict) -> None:
     if sys.stdout is None:
         return
     kind = payload.get("kind")
-    if kind == "job":
+    if kind == "source_preflight_start":
+        print("Source preflight: full-row safety inspection",flush=True)
+    elif kind == "source_preflight_progress":
+        print(f"Source preflight: {payload['completed_days']}/{payload['total_days']} logical days",flush=True)
+    elif kind == "source_preflight_done":
+        print(f"Source preflight: {payload['status']}; report: {payload['report']}",flush=True)
+    elif kind == "job":
         print(f"Port: {payload['port']}", flush=True)
         print(f"Period: {payload['year']}-{int(payload['month']):02d}", flush=True)
         print(f"Logical days: {payload['source_count']}", flush=True)
@@ -4389,9 +5494,12 @@ def cli_progress(payload: dict) -> None:
             print(f"  {path}", flush=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=APP_TITLE)
     parser.add_argument("--input", type=Path, help="每日 D&TMOK <PORT> Excel 資料夾")
+    parser.add_argument("--preflight-only",action="store_true",help="只做完整來源預檢，不執行數值處理或產生 Excel")
+    parser.add_argument("--preflight-report",type=Path,help="preflight-only 的新報告資料夾（不可放在來源內）")
+    parser.add_argument("--recursive",action="store_true",help="preflight-only 遞迴盤點子資料夾")
     parser.add_argument("--output", type=Path, help="Modern analysis 輸出 .xlsx")
     parser.add_argument("--finalize-from", type=Path, help="讀取已覆核 Modern workbook 並重生五份正式成果")
     parser.add_argument("--delivery-dir", type=Path, help="五份正式成果的輸出資料夾")
@@ -4407,7 +5515,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--direction-policy", choices=DIRECTION_POLICIES,
                         help="auto: KLNG=klng21，其他=all32；all32 不套地理遮罩，非已驗證海向政策")
     parser.add_argument("--radar-style", choices=RADAR_STYLES,
-                        help="auto: KLNG 線形，其他港別填色；可指定 line 或 filled")
+                        help="auto: 依六月確認成果使用填色；可指定 line 或 filled")
     parser.add_argument("--radar-max", type=float,
                         help="雷達圖刻度上限 NM；省略為 Excel 自動刻度，低於有效值會拒絕輸出，不改距離篩選")
     parser.add_argument("--tolerance", type=float, default=10.0, help="百分比，例如 10")
@@ -4431,7 +5539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
 
-    if all(
+    if not arguments.preflight_only and not arguments.recursive and all(
         value is None
         for value in (
             arguments.input,
@@ -4447,10 +5555,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.direction_policy,
             arguments.radar_style,
             arguments.radar_max,
+            arguments.preflight_report,
         )
     ):
         launch_gui()
         return 0
+    if arguments.preflight_only:
+        if arguments.input is None:
+            parser.error("--preflight-only 必須指定 --input")
+        if arguments.output is not None or arguments.finalize_from is not None:
+            parser.error("--preflight-only 不可搭配 --output 或 --finalize-from")
+        report = inspect_source_preflight(arguments.input,port=arguments.port,year=arguments.year,
+                                         month=arguments.month,recursive=arguments.recursive,
+                                         workers=arguments.workers,callback=cli_progress)
+        directory = arguments.preflight_report or (default_output_directory()/f"SOURCE_PREFLIGHT_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}")
+        path = save_source_preflight(report,directory)
+        if report['status']=='BLOCKED':
+            raise SourcePreflightError(f"來源預檢 BLOCKED；未產生正式 Excel。詳細報告：{path}",path)
+        if sys.stdout is not None:
+            print(f"Source preflight {report['status']}: {path}",flush=True)
+        return 0
+    if arguments.recursive or arguments.preflight_report is not None:
+        parser.error("--recursive／--preflight-report 只適用於 --preflight-only")
     if arguments.max_days is not None and arguments.max_files is not None:
         parser.error("--max-days 與 deprecated --max-files 不可同時指定")
     if arguments.finalize_from is not None:
@@ -4526,6 +5652,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     run_pipeline(config, callback=cli_progress)
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return _main(arguments)
+    except Exception as error:
+        return report_cli_failure(error,arguments)
 
 
 if __name__ == "__main__":

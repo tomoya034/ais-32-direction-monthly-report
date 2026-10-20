@@ -8,6 +8,57 @@
 
 尚無未發布變更。
 
+## [1.5.6] - 2026-10-20
+
+正式交付版；直接採用完整驗證的 hardening r2 binary，未為 release 重新 build。下列 local 版本段落保留當時狀態；最終驗證結論以本版與 Release Notes 為準。
+
+- 修正 CLI SourceFileError 逸出到 windowed bootloader 的互動錯誤對話框；統一 CLI／GUI 底層錯誤分類，CLI 保存結構化 FAIL log 並回傳非零。
+- 新增逐列 Source Preflight：schema／欄位 mapping、GPS 辨識但不授權轉換、mixed-date、完整日曆與來源日、partial-day、fragment/core overlap、完整多重集合 subset 證據及 immutable SHA。
+- 正式處理前阻擋不安全整月；不修改、拆分、去重或自動排除來源。預檢後及正式輸出前再驗來源身分。
+- 正式整合 source-days／calendar-days validation，缺日 cache 不可虛構，ledger／helper／detail 不可出現來源資料。新增真實 28/29/30/31 天與缺日 corruption-negative fixtures。
+- AUTO、90–100%、3-message、500 NM、Modern／Historical profiles、A/B 與32方向核心維持 frozen，不新增年度輸出功能。
+- 修正 preflight numeric channel 的 XML int／float／text 身分邊界，避免漏判 normalized duplicate；r2 已重新完成全部必要回歸。
+- 350 tests（0 failure/error/skip）；2026 334 份安全來源、303 logical days、10 港月首輪與重跑，以及2024六個安全月182份來源全部通過。26次港月、156工作簿、312對native geometry／decoded pixels均通過，數值差異0。
+- 桌面部署後由正式EXE GUI完整製作HWLN 2026/04、2026/06，各六份成果；cache／selector／spool／工作簿semantic／native Excel與24對圖表pixels均與既有r2 baseline一致。mixed-date CLI自然exit 2與GUI可讀拒絕、取消及正常關閉通過。
+- 保留既有選值研究限制；不宣稱AUTO已等同歷史人工判讀。正式套件不含任何AIS來源、reference或QA資料。
+
+## [1.5.5-local] - 2026-10-07
+
+本機候選；完整回歸與安裝驗證尚在進行，尚未建立公開 release。
+
+- 修正 Modern 路徑與五份 Historical 成果路徑相撞時覆寫決策台帳，且成功回報卻只剩五份成果的缺陷。
+- 加入跨程序資源鎖，保護共用輸出、cache 和 normalized spool；鎖寫入使用者暫存目錄，不寫入原始 AIS 資料夾。避免同時執行兩個 GUI／CLI 時固定 `.building`／`.tmp` 路徑互相干擾。
+- 首次分析的六份成果採同一組建置／提交／rollback；Historical 中途失敗不再留下新 Modern 搭配舊 Historical。
+- 覆核五檔與首次六檔共用提交與回復機制；未授權覆寫時使用原子拒絕既有目標操作，保留建置期間晚出現的同名檔。
+- 保護實際覆核輸入副本，拒絕其與 Historical／temporary／rollback／cache 路徑碰撞。GUI 來源 preflight 失敗不再留下停用的按鈕；首次輸出不預設授權覆寫。
+- source/copy 驗證器補強 manifest／檔案身分、checkpoint 原子寫入、失敗續跑、讀取期間變動檢查及本次 hash／沿用結果計數。
+- 全量 runner 保存完整計畫與中斷狀態；validator 不再把空報告或已完成的部分月份判為全量 PASS。獨立稽核保護原始／reference／cache／spool 位置，拒絕被改動或範圍不符的續跑紀錄。
+- 補充獨立來源／normalized row 全量稽核，並修正原報告對視覺等同、人工 reference、原重複輸出事件及正式可用性的過度聲稱。
+- Native 全系列/point 樣式盤點重現 Historical 標題16pt與人工5份reference的14pt不同；共用renderer改14pt。不同full/small角色的Chart Area geometry差異仍待修復與全量重验，不宣稱視覺完全相同。
+
+## [1.5.4-local] - 2026-10-05
+
+- 修正 HWLN 2026-04-01 至 04-09 的 `YYYYMMd` 檔名未被辨識、流程卻仍回報成功的 silent omission；來源掃描現在支援明確的 7／8 位日期並對無法解析的 AIS-like 檔名 fail closed。
+- Historical 圖表依六月正確成果重建：filled radar、30 色 Office palette、60% transparency、reference Chart/Plot Area、尺寸／anchor、KLNG 21 方位視覺順序，以及青色 MAX、橙色 MIN、紅色 2.25 pt AVG line。
+- 保留 floor-bin 32 方位與港別 policy：KLNG `klng21`，HWLN／其他站點 `all32`；沒有把花蓮問題修成港別硬編碼。
+- 新增全量來源 catalog、月份批次 runner、reference 比對、OOXML／內容驗證、Excel-native chart export 與 deterministic package hash 工具。
+- 保留 v1.5.3 exact-overlap fail-closed 行為。NAS 全量 335 檔中的 KLNG 2026-07-24 `_23`／`_24` 會如預期觸發 audit-truncated gate；既有逐列稽核已證明 `_23` 的 708,418 筆正規化資料有 99.999435% 包含於 `_24`，因此正式安全輸入依既有 manifest 排除被取代的 `_23`，保留 `_24`，不做 silent dedupe。
+
+## [1.5.3-local] - 2026-09-18
+
+本機修復與驗證版本；尚未建立 git tag、GitHub Release 或公開下載資產。
+
+### Fixed
+
+- 修正 Period A/B 大 workbook 在 `constant_memory` 模式下回寫較早列失效，導致「總表」AI:AL helper cells 與第二張歷史統計圖空白；維持逐列串流與大檔低記憶體特性，並以完整連續索引寫入 chart cache，避免 Excel 16.0 丟棄 combo chart series。
+- 修正 Modern、legacy 與 Historical 總表的空白引用／空集合統計公式；Excel 原生重算後缺值仍為空白，不會被 `IFERROR(blank_reference,"")` 或 `MAX/MIN(empty_range)` 轉成 0。
+- Modern、Historical Period A、Historical Period B 與 A/B 整合圖表標題加入 scope，避免把不同訊息 profile／period 定義的圖誤認為同一結果。
+
+### Changed
+
+- 非 byte-identical fragments 若含 exact normalized core duplicates，或 cross-fragment audit 超過 250,000 筆而無法證明安全，會停止本次月份處理且不產生／替換正式檔；不做 silent dedupe。只有互補 fragments、無 exact duplicate 的可完整稽核 overlap，以及 byte-identical 單次處理可繼續。
+- `CACHE_VERSION` 升為 7，強制舊 cache 6 失效並重掃原始 fragments，避免既有 cache 繞過新的 overlap safety gate。Normalized spool version 1 與 review schema `AIS_V15_REVIEW_3` 不變。
+
 ## [1.5.2] - 2026-09-15
 
 ### Fixed

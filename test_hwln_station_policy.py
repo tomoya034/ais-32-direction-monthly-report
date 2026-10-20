@@ -21,6 +21,7 @@ import ais_monthly_app as app
 
 DAY = dt.date(2026, 6, 1)
 CHART_NS = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}
+DRAWING_NS = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
 SHEET_NS = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 KLNG_INDEXES = tuple(range(11)) + tuple(range(22, 32))
 
@@ -53,6 +54,23 @@ def radar_xml(path: Path) -> ET.Element:
                 if root.find(".//c:radarChart", CHART_NS) is not None:
                     return root
     raise AssertionError(f"No radar chart: {path}")
+
+
+def statistics_chart_xml(path: Path) -> ET.Element:
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if name.startswith("xl/charts/chart") and name.endswith(".xml"):
+                root = ET.fromstring(archive.read(name))
+                if (
+                    root.find(".//c:barChart", CHART_NS) is not None
+                    and root.find(".//c:lineChart", CHART_NS) is not None
+                ):
+                    return root
+    raise AssertionError(f"No combined statistics chart: {path}")
+
+
+def chart_title(root: ET.Element) -> str:
+    return "".join(node.text or "" for node in root.findall(".//c:title//a:t", {**CHART_NS, **DRAWING_NS}))
 
 
 class StationPolicyTests(unittest.TestCase):
@@ -90,7 +108,7 @@ class StationPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             for port, policy, indexes, style in (
-                ("KLNG", "klng21", KLNG_INDEXES, "line"),
+                ("KLNG", "klng21", KLNG_INDEXES, "filled"),
                 ("hwln", "all32", tuple(range(32)), "filled"),
                 ("TCHG", "all32", tuple(range(32)), "filled"),
             ):
@@ -179,9 +197,181 @@ class StationPolicyTests(unittest.TestCase):
                                 (paths.integrated_summary, app.LOGICAL_DAY)):
                 self.assert_summary(path, KLNG_INDEXES, scope)
             root = radar_xml(paths.integrated_summary)
-            # XlsxWriter's existing unfilled radar serializes as marker, even
-            # when the series do not request visible point markers.
-            self.assertEqual(root.find(".//c:radarStyle", CHART_NS).get("val"), "marker")
+            self.assertEqual(root.find(".//c:radarStyle", CHART_NS).get("val"), "filled")
+            series = root.findall(".//c:radarChart/c:ser", CHART_NS)
+            fills = [
+                item.find(".//c:spPr/a:solidFill/a:srgbClr", {**CHART_NS, **DRAWING_NS})
+                for item in series
+            ]
+            self.assertEqual(
+                [item.get("val") for item in fills],
+                [
+                    color.lstrip("#")
+                    for color in app.LEGACY_RADAR_PALETTE[: len(fills)]
+                ],
+            )
+            self.assertTrue(
+                all(
+                    item.find("a:alpha", DRAWING_NS).get("val") == "40000"
+                    for item in fills
+                )
+            )
+            statistics = statistics_chart_xml(paths.integrated_summary)
+            bars = statistics.findall(".//c:barChart/c:ser", CHART_NS)
+            line = statistics.find(".//c:lineChart/c:ser", CHART_NS)
+            self.assertEqual(
+                [
+                    item.find(
+                        ".//c:spPr/a:solidFill/a:srgbClr",
+                        {**CHART_NS, **DRAWING_NS},
+                    ).get("val")
+                    for item in bars
+                ],
+                ["00B0F0", "ED7D31"],
+            )
+            line_shape = line.find(".//c:spPr/a:ln", {**CHART_NS, **DRAWING_NS})
+            self.assertEqual(line_shape.get("w"), "28575")
+            self.assertEqual(
+                line_shape.find("a:solidFill/a:srgbClr", DRAWING_NS).get("val"),
+                "FF0000",
+            )
+
+    def test_delivery_statistics_helpers_and_chart_cache_match_full_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_folder = Path(temporary)
+            for port, indexes in (("HWLN", tuple(range(32))), ("KLNG", KLNG_INDEXES)):
+                with self.subTest(port=port):
+                    folder = root_folder / port
+                    folder.mkdir()
+                    config, _, result = self.prepare(folder, port=port)
+                    snapshot = app.build_default_decision_snapshot(config, [result])
+                    paths = app.write_delivery_workbooks(
+                        config, [result], snapshot, root=folder / "delivery"
+                    )
+                    self.assertIn(
+                        "2026-06 AIS通訊最近最遠距離(浬)",
+                        chart_title(statistics_chart_xml(paths.integrated_summary)),
+                    )
+                    for _scope_title, full_path, summary_path in (
+                        (
+                            "Historical Period A 00:00–11:59",
+                            paths.period_a_full,
+                            paths.period_a_summary,
+                        ),
+                        (
+                            "Historical Period B 12:00–23:59",
+                            paths.period_b_full,
+                            paths.period_b_summary,
+                        ),
+                        (
+                            "Historical Period A/B 整合 MAX",
+                            paths.integrated_summary,
+                            paths.integrated_summary,
+                        ),
+                    ):
+                        helper_matrices = []
+                        chart_details = []
+                        for path in (full_path, summary_path):
+                            workbook = openpyxl.load_workbook(
+                                path, read_only=True, data_only=True
+                            )
+                            try:
+                                helper = list(
+                                    workbook["總表"].iter_rows(
+                                        min_row=1,
+                                        max_row=len(indexes) + 1,
+                                        min_col=35,
+                                        max_col=38,
+                                        values_only=True,
+                                    )
+                                )
+                            finally:
+                                workbook.close()
+                            self.assertEqual(
+                                helper[0], ("納入方位", "MAX", "MIN", "AVERAGE")
+                            )
+                            self.assertEqual(
+                                tuple(row[0] for row in helper[1:]),
+                                tuple(
+                                    app.LEGACY_DIRECTION_ABBREVIATIONS[i]
+                                    for i in app.legacy_chart_direction_indexes(config)
+                                ),
+                            )
+                            for column in range(1, 4):
+                                self.assertTrue(
+                                    any(row[column] is not None for row in helper[1:])
+                                )
+                                self.assertTrue(
+                                    any(row[column] is None for row in helper[1:])
+                                )
+                            helper_matrices.append(helper)
+
+                            chart = statistics_chart_xml(path)
+                            self.assertIn(
+                                "2026-06 AIS通訊最近最遠距離(浬)",
+                                chart_title(chart),
+                            )
+                            plot_visible_only = chart.find(".//c:plotVisOnly", CHART_NS)
+                            # XlsxWriter's public show_hidden_data() encodes false
+                            # by omitting plotVisOnly; its default emitted form is val=1.
+                            self.assertIsNone(plot_visible_only)
+                            series = [
+                                *chart.findall(".//c:barChart/c:ser", CHART_NS),
+                                *chart.findall(".//c:lineChart/c:ser", CHART_NS),
+                            ]
+                            self.assertEqual(len(series), 3)
+                            formulas_and_caches = []
+                            for series_index, item in enumerate(series):
+                                category_formula = item.find("c:cat/*/c:f", CHART_NS)
+                                value_formula = item.find("c:val/c:numRef/c:f", CHART_NS)
+                                self.assertIsNotNone(category_formula)
+                                self.assertIsNotNone(value_formula)
+                                point_count = item.find(
+                                    "c:val/c:numRef/c:numCache/c:ptCount", CHART_NS
+                                )
+                                self.assertIsNotNone(point_count)
+                                self.assertEqual(
+                                    int(point_count.get("val")), len(indexes)
+                                )
+                                cache = {
+                                    int(point.get("idx")): float(
+                                        point.find("c:v", CHART_NS).text
+                                    )
+                                    for point in item.findall(
+                                        "c:val/c:numRef/c:numCache/c:pt", CHART_NS
+                                    )
+                                }
+                                # Chart points must preserve the same blank vs
+                                # actual-zero distinction as their source helper
+                                # cells; absent observations are not radius zero.
+                                expected_cache = {
+                                    offset: float(row[series_index + 1])
+                                    for offset, row in enumerate(helper[1:])
+                                    if row[series_index + 1] is not None
+                                }
+                                self.assertEqual(cache, expected_cache)
+                                for offset, row in enumerate(helper[1:]):
+                                    if row[series_index + 1] is None:
+                                        self.assertNotIn(offset, cache)
+                                formulas_and_caches.append(
+                                    (category_formula.text, value_formula.text, cache)
+                                )
+
+                            last_row = len(indexes) + 1
+                            self.assertEqual(
+                                [(category, value) for category, value, _cache in formulas_and_caches],
+                                [
+                                    (
+                                        f"總表!$AI$2:$AI${last_row}",
+                                        f"總表!${column}$2:${column}${last_row}",
+                                    )
+                                    for column in ("AJ", "AK", "AL")
+                                ],
+                            )
+                            chart_details.append(formulas_and_caches)
+
+                        self.assertEqual(helper_matrices[0], helper_matrices[1])
+                        self.assertEqual(chart_details[0], chart_details[1])
 
     def test_future_functions_are_excel_serialized_without_changing_retained_maxima(self) -> None:
         """Check OOXML, not just XlsxWriter's precomputed values; no recalc claim."""
@@ -223,6 +413,87 @@ class StationPolicyTests(unittest.TestCase):
                     for formula in stdev:
                         self.assertIn("_xlfn.STDEV.S(", formula)
                         self.assertNotIn("_xlfn._xlfn.", formula)
+
+    def test_blank_links_and_statistics_are_guarded_for_native_recalculation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            config, _, result = self.prepare(
+                folder, legacy_output_path=folder / "legacy.xlsx"
+            )
+            snapshot = app.build_default_decision_snapshot(config, [result])
+            app.write_monthly_workbook(config, [result], [], snapshot)
+            app.write_legacy_workbook(config, [result])
+            paths = app.write_delivery_workbooks(
+                config, [result], snapshot, root=folder / "delivery"
+            )
+
+            workbook = openpyxl.load_workbook(config.output_path, data_only=False)
+            try:
+                summary = workbook["總表"]
+                self.assertEqual(
+                    summary["AG5"].value,
+                    '=IF(COUNT(\'6月1日\'!AM4)=0,"",\'6月1日\'!AM4)',
+                )
+                self.assertEqual(
+                    summary["AG7"].value,
+                    '=IF(COUNT(AG5:AG5)<1,"",MAX(AG5:AG5))',
+                )
+                self.assertEqual(
+                    summary["AG10"].value,
+                    '=IF(COUNT(AG5:AG5)<2,"",_xlfn.STDEV.S(AG5:AG5))',
+                )
+                self.assertEqual(
+                    summary["AJ36"].value,
+                    '=IF(COUNT(AG7)=0,NA(),AG7)',
+                )
+                # This error is deliberate and restricted to chart-only
+                # helpers: native empty-string series falsely plotted zero.
+                # Primary cells above retain their exact blank contracts.
+                for index in range(32):
+                    source = f"{openpyxl.utils.get_column_letter(index + 2)}5"
+                    self.assertEqual(summary.cell(5, 41 + index).value,
+                                     f'=IF(COUNT({source})=0,NA(),{source})')
+                self.assertTrue(summary.column_dimensions["AO"].hidden)
+            finally:
+                workbook.close()
+            cached = openpyxl.load_workbook(config.output_path, data_only=True)
+            try:
+                self.assertIsNone(cached["總表"]["AG5"].value)
+                self.assertIsNone(cached["總表"]["AG7"].value)
+                for address in ("AJ36", "BT5"):
+                    self.assertEqual(cached["總表"][address].value, "#N/A")
+                    self.assertEqual(cached["總表"][address].data_type, "e")
+            finally:
+                cached.close()
+
+            workbook = openpyxl.load_workbook(
+                config.legacy_output_path, data_only=False
+            )
+            try:
+                self.assertEqual(
+                    workbook["總表"]["AG2"].value,
+                    '=IF(COUNT(\'6月1日\'!AM2)=0,"",\'6月1日\'!AM2)',
+                )
+            finally:
+                workbook.close()
+
+            workbook = openpyxl.load_workbook(paths.period_b_full, data_only=False)
+            try:
+                summary = workbook["總表"]
+                self.assertEqual(
+                    summary["R2"].value,
+                    '=IF(COUNT(\'6月1日\'!X2)=0,"",\'6月1日\'!X2)',
+                )
+                self.assertEqual(
+                    summary["R4"].value,
+                    '=IF(COUNT(R2:R2)<1,"",MAX(R2:R2))',
+                )
+                self.assertEqual(
+                    summary["R7"].value,
+                    '=IF(COUNT(R2:R2)<2,"",_xlfn.STDEV.S(R2:R2))',
+                )
+            finally:
+                workbook.close()
 
     def test_policy_changes_invalidate_cache_and_decision_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -281,6 +552,7 @@ class StationPolicyTests(unittest.TestCase):
             app.write_monthly_workbook(config, [result], [], snapshot)
             app.write_legacy_workbook(config, [result])
             paths = app.write_delivery_workbooks(config, [result], snapshot, root=folder / "delivery")
+            self.assertIn("Modern logical-day", chart_title(radar_xml(config.output_path)))
             for path in (config.output_path, config.legacy_output_path, *paths.all_files()):
                 with self.subTest(path=path.name):
                     root = radar_xml(path)
@@ -293,7 +565,14 @@ class StationPolicyTests(unittest.TestCase):
                         values = series.find("c:val/c:numRef/c:f", CHART_NS)
                         self.assertIsNotNone(categories)
                         self.assertRegex(categories.text, r"\$B\$\d+:\$AG\$\d+$")
-                        self.assertRegex(values.text, r"\$B\$\d+:\$AG\$\d+$")
+                        if path == config.output_path:
+                            self.assertEqual(values.text, "總表!$AO$5:$BT$5")
+                            self.assertIsNone(root.find(".//c:plotVisOnly", CHART_NS))
+                        elif path in (paths.period_a_full, paths.period_b_full, paths.integrated_summary):
+                            self.assertEqual(values.text, "總表!$AO$2:$BT$2")
+                            self.assertIsNone(root.find(".//c:plotVisOnly", CHART_NS))
+                        else:
+                            self.assertRegex(values.text, r"\$B\$\d+:\$AG\$\d+$")
                         cached = {int(point.get("idx")): float(point.find("c:v", CHART_NS).text)
                                   for point in series.findall("c:val/c:numRef/c:numCache/c:pt", CHART_NS)}
                         # A visually empty direction must not become a zero
@@ -357,7 +636,9 @@ class StationPolicyTests(unittest.TestCase):
                     self.assertEqual(len(series), 1)
                     self.assertEqual(series[0].find("c:tx/c:v", CHART_NS).text, "本時段無有效資料")
                     formula = series[0].find("c:val/c:numRef/c:f", CHART_NS).text
-                    self.assertEqual(formula, "總表!$B$2:$AG$2")
+                    self.assertEqual(formula, "總表!$AO$2:$BT$2" if path in
+                                     (paths.period_a_full, paths.period_b_full, paths.integrated_summary)
+                                     else "總表!$B$2:$AG$2")
                     self.assertEqual(series[0].findall("c:val/c:numRef/c:numCache/c:pt", CHART_NS), [])
             # Occupied periods retain their actual date series; the two missing
             # dates remain table rows without drawing empty filled polygons.

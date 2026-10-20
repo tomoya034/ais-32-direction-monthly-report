@@ -1,11 +1,48 @@
-AIS 32 方位月報一鍵製作 v1.5.2
-=================================
+AIS 32 方位月報一鍵製作
+========================
+
+正式交付版：v1.5.6（2026-10-20；直接採用完整驗證的r2 EXE，未重新build）
+下載：GitHub Releases v1.5.6，套件名 AIS_32_Direction_Monthly_Report_v1.5.6.zip
+EXE SHA-256：EAC52BB03AD50A6CFEAD1C38332D54ED64C97D6DCD22DA2F14AA826294F88AC1
+升級前請保留舊EXE及既有輸出；核對SHA後執行。詳細驗證見Release_Notes.md。
+過往版本章節保留歷史紀錄，以本版規則及cache version 7為準。
+
+【v1.5.6 來源預檢與 CLI】
+- 正常分析前自動逐列預檢來源，產生 SOURCE_PREFLIGHT_REPORT.json 與人讀摘要。
+- GPS_* 已辨識但未授權轉換；mixed-date 不拆檔、不改日，整月阻擋。
+- 重複／subset 不自動排除。請保留原始檔，依證據與明確 manifest 另建安全來源 view。
+- 缺日與部分日會警告；日曆列保留缺日空白，不偽造來源 cache。
+- CLI 來源錯誤以非零結束並留下 AIS32_CLI_FAILURE_*.json；GUI 仍顯示可理解的錯誤。
+- AUTO 與所有核心數值規則未變；舊v1.5.5 candidate保留，原桌面v1.5.4-local另有可回復備份。
+- 2026全量雙跑、2024六個安全月及負向來源測試通過；部署後HWLN 2026/04、2026/06各六份成果與r2 baseline數值、工作簿及native圖表一致。
+
+【v1.5.5 輸出安全修復】
+- 開始前拒絕 Modern／五份正式成果相互同名，及輸出／暫存檔與 AIS 原始來源碰撞。
+- 同一電腦另一個程序正在使用相同輸出、cache 或 normalized spool 時，停止並顯示鎖資訊；請等待該工作完成。
+- 首次分析先完成全部六份工作簿，再整組提交；錯誤時還原原有成果，避免新台帳配舊表格。
+- 未同意覆寫時，建置期間晚出現的同名檔也不替換。GUI 只有確認既有成果且同意後才授權覆寫。
+- 覆核輸入可使用原 Modern 或獨立副本，但不可命名／放置成 Historical、temporary、rollback 或 cache 檔案。
+- 程序鎖位於使用者暫存目錄，不寫入 AIS 原始資料夾。殘留鎖不會自動刪除，須確認原程序已結束後再處理。
+- 無人工覆核台帳的自動選值仍需研究判讀；不能只因流程完成就視為已核准成果。
+
+【v1.5.4 結案後全量回歸修復】
+- 支援 YYYYMMd 個位日期檔名，避免 HWLN 4/1–4/9 靜默漏跑。
+- AIS-like 檔名無法解析時停止並報錯，不再跳過。
+- Historical 雷達圖與統計圖依六月確認成果的圖型、色盤、透明度、Plot Area、方位顯示順序、尺寸及位置輸出。
+
+【v1.5.3 本機驗證修復】
+- 修正 Period A/B 大 workbook AI:AL helper cells 與第二張 Historical 統計圖空白；維持 constant_memory 低記憶體模式。
+- 五份 Historical Chart 2 使用連續 chart cache；helper 缺值仍留白。
+- Modern、legacy 與 Historical 總表的引用／統計公式加入 COUNT guard；Excel 重算後缺值不會變成 0。
+- Modern、Historical Period A/B 與 A/B 整合圖表標題標示各自 scope。
+- exact normalized core duplicate 或超過 250,000 筆且無法證明安全的 overlap audit 會停止整月，不 silent dedupe。
+- cache version 7 會強制 cache 6 失效並重掃原始 fragments；normalized spool version 1、review schema AIS_V15_REVIEW_3 不變。
 
 【v1.5.2 方位排除修正】
 方位設定 auto：KLNG 維持原21方位，HWLN及其他站點採all32，不套KLNG地理排除。
 all32表示保留32方位有效結果，不表示已證明32個方向全是海域。
 可明確選擇klng21或all32；沒有資料的方位仍留白，不補0。
-雷達樣式auto：KLNG維持線形，其他站點使用填色；亦可自行選line或filled。
+雷達樣式auto：依六月確認成果使用填色；亦可自行選line或filled。
 雷達刻度上限留白表示自動。自訂上限不能小於圖中有效數值，避免裁切資料。
 選值距離上限300/500 NM與雷達圖刻度是不同設定。
 cache version 6、review schema AIS_V15_REVIEW_3；舊覆核檔請由原始資料重新分析、覆核。
@@ -24,7 +61,7 @@ review schema 升為 AIS_V15_REVIEW_2。v1.5.0 覆核 workbook 不相容：
 
 【第一次分析】
 1. 雙擊 AIS_32方位月報工具.exe；不需要 Python、Token 或 API Key。
-2. 選擇含 D&TMOK <PORT>_YYYYMMDD_*.xlsx 的原始月份資料夾。
+2. 選擇含 D&TMOK <PORT>_YYYYMMDD_*.xlsx 的原始月份資料夾；既有個位日期 YYYYMMd 亦支援。
 3. 程式會由檔名判定港別與年月；多港／多月份時請從清單選擇。
 4. 確認 Modern 分析輸出位置。五份正式成果會固定建立在畫面顯示的資料夾。
 5. 按「開始全自動製作」。完成後共有一份 Modern 分析及五份正式成果。
@@ -74,7 +111,7 @@ Period 依每列實際時間定義，與檔名尾碼無關：
 
 【異常與安全】
 - 相同 timestamp 可能是正常不同 AIS 訊息，不會只因同秒就去重。
-- 整檔 SHA-256 完全相同時只處理一次；其他重疊只診斷，不 silent dedupe。
+- 整檔 SHA-256 完全相同時只處理一次；其他重疊不 silent dedupe。若發現 exact normalized core duplicate，或 250,000 筆 audit 上限內無法證明安全，該月份會停止；請移除重複檔，或另建只含已確認互補 fragments 的安全來源資料夾後重跑。
 - 損壞檔案、缺少必要欄位、列內日期與檔名不同會停止正式輸出。
 - Excel 每張明細最多 1,048,575 筆；超限會停止，絕不截斷。
 - 五份成果全部成功建立後才整組替換；失敗時保留原本五檔。

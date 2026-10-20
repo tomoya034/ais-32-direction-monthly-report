@@ -82,14 +82,21 @@ class ReleaseMetadataTests(unittest.TestCase):
         version_info = (root / "version_info.txt").read_text(encoding="utf-8")
         readme = (root / "README.md").read_text(encoding="utf-8")
         usage = (root / "使用說明.txt").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
 
-        self.assertEqual(APP_VERSION, "1.5.2")
+        self.assertEqual(APP_VERSION, "1.5.6")
         self.assertEqual(version, APP_VERSION)
         self.assertEqual(project["project"]["version"], APP_VERSION)
-        self.assertIn("filevers=(1, 5, 2, 0)", version_info)
-        self.assertIn("prodvers=(1, 5, 2, 0)", version_info)
-        self.assertIn("v1.5.2", readme)
-        self.assertIn("v1.5.2", usage)
+        self.assertIn("filevers=(1, 5, 6, 0)", version_info)
+        self.assertIn("prodvers=(1, 5, 6, 0)", version_info)
+        self.assertIn("目前 source 為 `v1.5.6`", readme)
+        self.assertIn("公開下載仍為 `v1.5.2`", readme)
+        self.assertNotIn("releases/tag/v1.5.3", readme)
+        self.assertRegex(usage, r"本機(?:候選|修復)版：v1\.5\.6")
+        self.assertIn("公開下載版：v1.5.2", usage)
+        self.assertIn("## [1.5.5-local] - 2026-10-07", changelog)
+        self.assertIn("compare/v1.5.2...HEAD", changelog)
+        self.assertNotIn("compare/v1.5.3", changelog)
 
 
 class SelectorBaselineTests(unittest.TestCase):
@@ -371,7 +378,7 @@ class FragmentCatalogTests(unittest.TestCase):
             self.assertNotIn("possible duplicate events", joined)
             self.assertEqual(result.rows_normalized, 3)
 
-    def test_occupied_overlap_reports_normal_possible_and_exact_without_dedupe(self) -> None:
+    def test_occupied_overlap_without_exact_duplicate_reports_and_continues(self) -> None:
         import tempfile
 
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
@@ -390,7 +397,7 @@ class FragmentCatalogTests(unittest.TestCase):
                 second,
                 [
                     (1, 0, "B", 1, 49.0),
-                    (1, 1, "A", 3, 40.0),
+                    (1, 1, "A", 3, 39.5),
                     (1, 2, "A", 3, 29.0),
                 ],
             )
@@ -400,10 +407,58 @@ class FragmentCatalogTests(unittest.TestCase):
             joined = "\n".join(result.diagnostics)
             self.assertIn("occupied-second overlap", joined)
             self.assertIn("normal same-second different AIS messages：1 秒", joined)
-            self.assertIn("possible duplicate events：1 筆", joined)
-            self.assertIn("exact normalized core records：1 筆", joined)
+            self.assertIn("possible duplicate events：2 筆", joined)
+            self.assertIn("exact normalized core records：0 筆", joined)
             self.assertIn("未自動去重", joined)
             self.assertEqual(result.rows_normalized, 6)
+
+    def test_exact_normalized_core_overlap_blocks_month(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first = folder / "D&TMOK KLNG_20260601_alpha.xlsx"
+            second = folder / "D&TMOK KLNG_20260601_beta.xlsx"
+            records = [(1, 1, "A", 3, 40.0)]
+            self._write_records(first, records)
+            self._write_records(second, [*records, (1, 2, "B", 18, 39.0)])
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+
+            with self.assertRaises(SourceFileError) as raised:
+                process_month(config)
+
+            message = str(raised.exception)
+            self.assertIn(first.name, message)
+            self.assertIn(second.name, message)
+            self.assertIn("exact normalized core records：1 筆", message)
+            self.assertIn("本次月份處理已停止", message)
+            self.assertIn("移除其中一個重複檔", message)
+            self.assertIn("安全來源資料夾", message)
+            self.assertFalse(config.output_path.exists())
+
+    def test_truncated_fragment_overlap_audit_blocks_month(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            folder = Path(temporary)
+            first = folder / "D&TMOK KLNG_20260601_alpha.xlsx"
+            second = folder / "D&TMOK KLNG_20260601_beta.xlsx"
+            self._write_records(first, [(1, 0, "A", 1, 50.0)])
+            self._write_records(second, [(1, 0, "B", 3, 49.0)])
+            config = AppConfig(folder, folder / "result.xlsx", "KLNG", 2026, 6)
+
+            with mock.patch("ais_monthly_app.DUPLICATE_AUDIT_RECORD_LIMIT", 1):
+                with self.assertRaises(SourceFileError) as raised:
+                    process_month(config)
+
+            message = str(raised.exception)
+            self.assertIn(first.name, message)
+            self.assertIn(second.name, message)
+            self.assertIn("record audit 超過 1 筆上限", message)
+            self.assertIn("無法證明兩檔沒有重複紀錄", message)
+            self.assertIn("本次月份處理已停止", message)
+            self.assertIn("安全來源資料夾", message)
+            self.assertFalse(config.output_path.exists())
 
     def test_official_day_processing_rejects_missing_time_schema(self) -> None:
         import tempfile

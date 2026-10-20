@@ -111,8 +111,8 @@ class DirectionPersistenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "schema 版本不相容"):
                     app.validate_review_workbook_schema(schema)
 
-    def test_cache_v5_invalidates_without_changing_numeric_spool(self) -> None:
-        self.assertEqual(app.CACHE_VERSION, 6)
+    def test_cache_v6_invalidates_without_changing_numeric_spool(self) -> None:
+        self.assertEqual(app.CACHE_VERSION, 7)
         self.assertEqual(app.NORMALIZED_SPOOL_VERSION, 1)
         self.assertEqual(app.REVIEW_WORKBOOK_SCHEMA, "AIS_V15_REVIEW_3")
         with tempfile.TemporaryDirectory() as temporary:
@@ -124,7 +124,7 @@ class DirectionPersistenceTests(unittest.TestCase):
             result = app.process_day_input(day_input, config)
             spool = app._normalized_spool_path(config, day_input.day)
             original = spool.read_bytes()
-            with mock.patch.object(app, "CACHE_VERSION", 5):
+            with mock.patch.object(app, "CACHE_VERSION", 6):
                 app.save_cached_day(day_input, config, result)
             self.assertIsNone(app.load_cached_day(day_input, config))
             self.assertEqual(spool.read_bytes(), original)

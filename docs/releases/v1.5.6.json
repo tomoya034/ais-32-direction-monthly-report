@@ -1,6 +1,9 @@
 {
   "version": "1.5.6",
-  "release_date": "2026-10-20",
+  "release_date": "2026-10-21",
+  "initial_package_date": "2026-10-20",
+  "release_tag": "v1.5.6-release1",
+  "preserved_initial_tag": "v1.5.6",
   "validated_build_iteration": "r2",
   "candidate_directory": "dist_candidate_v156_hardening_20261019_r2",
   "executable": "AIS_32方位月報工具.exe",
@@ -12,6 +15,7 @@
   "rebuild_for_release": false,
   "production_changes_during_release": [],
   "release_documentation_only_updates": ["README.md", "CHANGELOG.md", "使用說明.txt"],
+  "release1_test_support_updates": ["test_packaged_full_regression.py", "test_independent_month_collector.py", "test_v15_contracts.py"],
   "hardening_tests": {"run": 350, "failures": 0, "errors": 0, "skips": 0},
   "hardening_port_month_runs": 26,
   "hardening_workbooks": 156,
@@ -30,5 +34,5 @@
   "selector_changed": false,
   "auto_equals_manual": "UNVERIFIED",
   "gps_schema": "DETECTED_AND_BLOCKED_NO_ADAPTER",
-  "build_provenance": "Validated working-tree freeze; release commit adds documentation only over the frozen production/test/validation bytes. No claim that binary was rebuilt from release commit."
+  "build_provenance": "Validated working-tree freeze; production and validation implementation bytes remain frozen. Release1 changes synthetic test-fixture canonical paths, release metadata assertions and documentation only. Original v1.5.6 tag is preserved. Binary is the same accepted r2 bytes, not rebuilt from release1 commit."
 }

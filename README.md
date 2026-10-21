@@ -1,12 +1,14 @@
 # AIS 32 方位月報一鍵製作
 
 [![Tests](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml/badge.svg)](https://github.com/tomoya034/ais-32-direction-monthly-report/actions/workflows/tests.yml)
-[![Public release](https://img.shields.io/badge/public_release-v1.5.6-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6)
+[![Public release](https://img.shields.io/badge/public_release-v1.5.6-blue)](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6-release1)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 離線讀取 `D&TMOK <PORT>_YYYYMMDD_*.xlsx`（亦相容既有個位日期 `YYYYMMd`），把同港別、同日期的任意數量檔案視為同一個 logical day，再一次產生 Modern research 分析及五份正式 Historical delivery 工作簿。檔名尾碼只供追溯，不代表固定來源或時段；程式不使用雲端 API，也不會上傳 AIS 資料。
 
 > 正式交付版為 `v1.5.6`：直接採用完整回歸通過的 r2 EXE，未重新 build。已完成 2026 全量雙跑、2024 六個安全月、負向來源測試，以及桌面部署後 HWLN 2026/04、2026/06 實機驗收。AUTO、message profiles、A/B、500 NM 與32方位分箱不變；AUTO 等同人工研究判讀仍未被證明。正式驗證範圍及升級限制見 [`v1.5.6 Release Notes`](docs/RELEASE_V1.5.6.md)；過往 local 版本章節是歷史紀錄，以本版說明為準。
+
+正式發布標籤為 `v1.5.6-release1`，產品與 Windows EXE 版本仍為 `1.5.6`。原 `v1.5.6` tag 保留當時 CI 失敗紀錄，未移動或刪除；release1 只修 synthetic 測試路徑／發布 metadata 契約並更新文件，沒有重新編譯 binary。
 
 ## 1.5.6：Source Preflight 與 CLI hardening
 
@@ -62,7 +64,7 @@
 
 ## 📥 下載與標準流程
 
-1. Windows 執行版請下載 [GitHub Releases v1.5.6](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6) 的 `AIS_32_Direction_Monthly_Report_v1.5.6.zip`，並核對附上的 `SHA256SUMS.txt`。
+1. Windows 執行版請下載 [GitHub Releases v1.5.6](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6-release1) 的 `AIS_32_Direction_Monthly_Report_v1.5.6.zip`，並核對附上的 `SHA256SUMS.txt`。
 2. 解壓縮後雙擊 `AIS_32方位月報工具.exe`，不必安裝 Python。
 3. 選擇原始月份資料夾；工具會從檔名辨識港別與年月。
 4. 按「開始全自動製作」。第一次執行會產生一份 Modern 分析與五份正式成果。

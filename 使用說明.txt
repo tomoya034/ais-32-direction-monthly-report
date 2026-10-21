@@ -1,7 +1,9 @@
 AIS 32 方位月報一鍵製作
 ========================
 
-正式交付版：v1.5.6（2026-10-20；直接採用完整驗證的r2 EXE，未重新build）
+正式交付版：v1.5.6（2026-10-21；直接採用完整驗證的r2 EXE，未重新build）
+正式發布標籤：v1.5.6-release1（產品與EXE版本仍為1.5.6，舊v1.5.6 tag保留）
+下載頁：https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6-release1
 下載：GitHub Releases v1.5.6，套件名 AIS_32_Direction_Monthly_Report_v1.5.6.zip
 EXE SHA-256：EAC52BB03AD50A6CFEAD1C38332D54ED64C97D6DCD22DA2F14AA826294F88AC1
 升級前請保留舊EXE及既有輸出；核對SHA後執行。詳細驗證見Release_Notes.md。

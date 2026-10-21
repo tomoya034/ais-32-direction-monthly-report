@@ -14,7 +14,7 @@ class IndependentMonthCollectorTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="ais-month-collector-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source, self.run, self.reports = (self.root / name for name in ("source", "run", "reports"))
         self.reports.mkdir()
         for token, port, day, suffixes in (("HWLN_202601", "HWLN", "2026-01-01", ("23",)),

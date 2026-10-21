@@ -2,9 +2,13 @@
 
 來源預檢與錯誤處理強化版：直接交付已完成完整回歸的 r2 EXE，沒有重新 build，也沒有改變研究選值規則。
 
+正式發布tag：`v1.5.6-release1`（2026-10-21）。產品／Windows版本仍為1.5.6，EXE SHA維持`EAC52BB03AD50A6CFEAD1C38332D54ED64C97D6DCD22DA2F14AA826294F88AC1`。
+
+原`v1.5.6` tag與當時失敗CI保留，未移動或刪除。本次release1只將兩組synthetic測試fixture根路徑canonical化，並將metadata測試從舊候選文案改為核對正式版本、tag與EXE SHA；沒有放寬resume validator、改數值expected或重建EXE。CI與完整本機suite重新驗證後才發布，不用舊PASS代替。
+
 ## 📥 下載
 
-Windows 請下載 `AIS_32_Direction_Monthly_Report_v1.5.6.zip`，解壓縮後執行 `AIS_32方位月報工具.exe`，不需要 Python。核對套件及 EXE 的 `SHA256SUMS.txt`；`Source code` 不是 Windows 執行版。
+Windows 請至 [v1.5.6-release1](https://github.com/tomoya034/ais-32-direction-monthly-report/releases/tag/v1.5.6-release1) 下載 `AIS_32_Direction_Monthly_Report_v1.5.6.zip`，解壓縮後執行 `AIS_32方位月報工具.exe`，不需要 Python。核對套件及 EXE 的 `SHA256SUMS.txt`；`Source code` 不是 Windows 執行版。
 
 ## ✨ 本版重點
 

@@ -8,9 +8,11 @@
 
 尚無未發布變更。
 
-## [1.5.6] - 2026-10-20
+## [1.5.6] - 2026-10-21
 
 正式交付版；直接採用完整驗證的 hardening r2 binary，未為 release 重新 build。下列 local 版本段落保留當時狀態；最終驗證結論以本版與 Release Notes 為準。
+
+- 正式發布tag為`v1.5.6-release1`，產品版本仍1.5.6；原`v1.5.6` tag保留，不重寫歷史。release1僅修兩組synthetic resume fixtures的canonical路徑與發布metadata測試契約，更新正式下載連結；production及validation演算法與已驗收EXE bytes均未改。
 
 - 修正 CLI SourceFileError 逸出到 windowed bootloader 的互動錯誤對話框；統一 CLI／GUI 底層錯誤分類，CLI 保存結構化 FAIL log 並回傳非零。
 - 新增逐列 Source Preflight：schema／欄位 mapping、GPS 辨識但不授權轉換、mixed-date、完整日曆與來源日、partial-day、fragment/core overlap、完整多重集合 subset 證據及 immutable SHA。
@@ -182,7 +184,8 @@
 - Excel 圖表、待複核清單與人工覆核欄。
 - PyInstaller 單一 EXE 建置腳本及自動測試。
 
-[Unreleased]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.6-release1...HEAD
+[1.5.6]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.2...v1.5.6-release1
 [1.5.2]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/tomoya034/ais-32-direction-monthly-report/compare/v1.4.0...v1.5.0

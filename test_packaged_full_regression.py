@@ -130,7 +130,7 @@ class PackagedResumeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="ais-packaged-resume-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source, self.output = self.root / "source", self.root / "output"
         self.source.mkdir()
         self.output.mkdir()
